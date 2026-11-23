@@ -1,6 +1,7 @@
 # 体积隔离：严禁将外部推理运行时、模型权重、角色动画大包与语音缓存纳入源码或发行包
 runtime_engines/
 assets/chars/
+release_zips/
 voice_cache/
 ref_voices/
 *.ckpt

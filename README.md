@@ -104,3 +104,19 @@ Deskpet/
   tools/                       离线素材/语音生成辅助脚本
   docs/v1_contract.md          IPC 契约权威文档
 ```
+
+---
+
+## 五、素材来源与开源协议声明
+
+### 1. 代码开源协议
+- 本项目源代码（`app/` 与 `tools/`）采用 **[MIT License](./LICENSE)** 开源，欢迎学习、修改与二次开发。
+
+### 2. 角色动画素材来源声明
+- 本项目使用的 8 位角色透明动作素材（`char-*.zip` 独立分发包及由此派生的小尺寸像素头像）来自开源项目：
+  - **[hunmer/aboutme-pets](https://github.com/hunmer/aboutme-pets/tree/main)**
+  - 上游原始素材归属：[PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet) 与基础立绘 [lokicorvus/crosspet](https://github.com/lokicorvus/crosspet)。
+- **授权限制**：遵循上游 `aboutme-pets` 仓库许可要求，角色动画与立绘衍生素材**禁止用于任何商业用途**；基于本素材进行公开二次创作或分发时，**必须保留并署名上述上游仓库来源**。
+
+### 3. 第三方语音与推理组件
+- 本地语音克隆引擎调用 **[RVC-Boss/GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)**（MIT 协议）及对应开源预训练权重，以及 AMD Windows 运行时兼容层 ZLUDA；上述外部运行时均与本软件本体完全隔离，由用户按需自行拉取使用。
