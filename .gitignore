@@ -1,0 +1,25 @@
+# 体积隔离：严禁将外部推理运行时、模型权重、角色动画大包与语音缓存纳入源码或发行包
+runtime_engines/
+assets/chars/
+voice_cache/
+ref_voices/
+*.ckpt
+*.pth
+*.safetensors
+*.bin.part
+*.part
+
+# 隐私与敏感凭证隔离：禁止提交本地数据库与环境变量
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+
+# 开发与构建产物
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/
+*.log
+.DS_Store

@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "chars": [
+    {
+      "id": "claude",
+      "name": "Claude",
+      "clips": 166,
+      "path": "chars/claude"
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "clips": 171,
+      "path": "chars/deepseek"
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini",
+      "clips": 100,
+      "path": "chars/gemini"
+    },
+    {
+      "id": "glm",
+      "name": "GLM",
+      "clips": 97,
+      "path": "chars/glm"
+    },
+    {
+      "id": "gpt",
+      "name": "GPT",
+      "clips": 193,
+      "path": "chars/gpt"
+    },
+    {
+      "id": "grok",
+      "name": "Grok",
+      "clips": 106,
+      "path": "chars/grok"
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi",
+      "clips": 105,
+      "path": "chars/kimi"
+    },
+    {
+      "id": "qwen",
+      "name": "Qwen",
+      "clips": 106,
+      "path": "chars/qwen"
+    }
+  ],
+  "generatedAt": "2026-11-22T17:00:22"
+}

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+runtime_engines/
+voice_cache/
+*.ckpt
+*.pth
+*.safetensors
+*.part
+*.log
+.DS_Store
