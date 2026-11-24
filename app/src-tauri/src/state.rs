@@ -362,8 +362,8 @@ pub struct Inner {
     /// AI 对话短期记忆（按角色分别保留最近 6 条消息）。
     pub chat_history: Mutex<HashMap<String, Vec<crate::ai_voice::ChatTurn>>>,
     pub chat_seq: AtomicU64,
-    pub last_click_voice_ms: AtomicI64,
     pub last_drag_voice_ms: AtomicI64,
+    pub last_any_voice_ms: AtomicI64,
     pub gpt_sovits: Arc<crate::gpt_sovits::GptSovitsRuntime>,
     pub assets_rt: Arc<crate::assets_mgr::AssetsRuntime>,
     pub pomodoro: Mutex<PomodoroStatusPayload>,
@@ -427,8 +427,8 @@ impl Shared {
                 passthrough_wake: (Mutex::new(0), Condvar::new()),
                 chat_history: Mutex::new(HashMap::new()),
                 chat_seq: AtomicU64::new(1),
-                last_click_voice_ms: AtomicI64::new(0),
                 last_drag_voice_ms: AtomicI64::new(0),
+                last_any_voice_ms: AtomicI64::new(0),
                 gpt_sovits: Arc::new(crate::gpt_sovits::GptSovitsRuntime::default()),
                 assets_rt: Arc::new(crate::assets_mgr::AssetsRuntime::default()),
                 pomodoro: Mutex::new(PomodoroStatusPayload::default()),
@@ -458,17 +458,6 @@ impl Shared {
         Some((guard.clone(), completed))
     }
 
-    pub fn try_claim_click_voice(&self, now_ms: i64) -> bool {
-        let prev = self.inner.last_click_voice_ms.load(Ordering::Relaxed);
-        if now_ms - prev < 2800 {
-            return false;
-        }
-        self.inner
-            .last_click_voice_ms
-            .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-    }
-
     pub fn try_claim_drag_voice(&self, now_ms: i64) -> bool {
         let prev = self.inner.last_drag_voice_ms.load(Ordering::Relaxed);
         if now_ms - prev < 4000 {
@@ -478,6 +467,14 @@ impl Shared {
             .last_drag_voice_ms
             .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
+    }
+
+    pub fn mark_any_voice_played(&self, now_ms: i64) {
+        self.inner.last_any_voice_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    pub fn last_any_voice_ms(&self) -> i64 {
+        self.inner.last_any_voice_ms.load(Ordering::Relaxed)
     }
 
     pub fn chat_ai_config(&self) -> crate::ai_voice::ChatAiConfig {
@@ -757,6 +754,10 @@ impl Shared {
 
     pub fn replay_current(&self) {
         if self.is_quitting() {
+            return;
+        }
+        // 前端已经上报过帧号，说明首帧已成功解码并开始渲染，无需再发冗余补播。
+        if self.inner.hint.lock().ok().and_then(|h| h.clone()).is_some() {
             return;
         }
         let Some(current) = self.inner.current.lock().ok().and_then(|slot| slot.clone()) else {

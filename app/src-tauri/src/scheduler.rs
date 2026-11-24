@@ -224,6 +224,12 @@ pub struct PlayRequest {
 pub enum Action {
     Play(PlayRequest),
     Bubble { text: String, ttl_ms: u64 },
+    Voice {
+        scene_key: String,
+        default_bubble: Option<String>,
+        ttl_ms: u64,
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -711,6 +717,330 @@ pub fn pick_for_binding_excluding(
     pick_weighted_value(&pool, &weights, rng.next_f64()).map(|clip| clip.clone())
 }
 
+/// 高频连点生气触发参数（#1）。
+pub const RAPID_CLICK_WINDOW_MS: i64 = 3_000;
+pub const RAPID_CLICK_THRESHOLD: usize = 5;
+pub const ANGRY_COOLDOWN_MS: i64 = 14_000;
+
+pub const ANGRY_CLIP_CANDIDATES: &[&str] = &[
+    "点击回应-傲娇生气",
+    "傲娇生气",
+    "生气鼓腮跺脚",
+    "生气鼓腮",
+    "憋气鼓腮",
+    "委屈赌气",
+    "合扇敲掌·等待不耐烦",
+    "玩游戏气急败坏",
+];
+
+pub fn resolve_angry_clip(
+    character: &CharacterRuntime,
+    history: &HashMap<String, i64>,
+    now_ms: i64,
+    rng: &mut Rng,
+) -> Option<ClipMeta> {
+    let matched: Vec<&ClipMeta> = ANGRY_CLIP_CANDIDATES
+        .iter()
+        .filter_map(|name| character.clip_map.get(*name).filter(|c| c.playable()))
+        .collect();
+    if !matched.is_empty() {
+        let weights: Vec<f64> = matched
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                let prio = if idx == 0 { 1.4 } else { 1.0 };
+                prio * selection_weight(history.get(&c.id).copied(), now_ms)
+            })
+            .collect();
+        return pick_weighted_value(&matched, &weights, rng.next_f64()).map(|c| c.clone());
+    }
+    pick_for_binding(character, "click", history, now_ms, rng)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbientTier {
+    Rest,
+    DailyPlayEat,
+    TalentEaster,
+}
+
+fn is_ambient_excluded(clip: &ClipMeta) -> bool {
+    if is_work_clip(clip) || clip.category == "drag" || clip.category == "click" {
+        return true;
+    }
+    const EXCLUDED_SUBSTRS: &[&str] = &[
+        "傲娇生气",
+        "生气鼓腮",
+        "委屈赌气",
+        "哭泣",
+        "害怕发抖",
+        "被吓一跳",
+        "惊吓后缩",
+        "震惊僵住",
+        "玩游戏气急败坏",
+        "垂头叹气",
+        "沮丧",
+        "焦虑踱步",
+        "深度思考",
+    ];
+    EXCLUDED_SUBSTRS.iter().any(|s| clip.id.contains(s))
+}
+
+pub fn classify_ambient_tier(clip: &ClipMeta, idle_bindings: &[String]) -> Option<AmbientTier> {
+    if !clip.playable() || is_ambient_excluded(clip) {
+        return None;
+    }
+    if matches!(
+        clip.category.as_str(),
+        "idle" | "chatter" | "balance" | "etiquette" | "species"
+    ) || idle_bindings.iter().any(|id| id == &clip.id)
+    {
+        return Some(AmbientTier::Rest);
+    }
+    if matches!(
+        clip.category.as_str(),
+        "daily" | "play" | "eat" | "move" | "turn"
+    ) {
+        return Some(AmbientTier::DailyPlayEat);
+    }
+    if matches!(
+        clip.category.as_str(),
+        "talent" | "festival" | "seasonal" | "vfx" | "outfit" | "emotion"
+    ) {
+        return Some(AmbientTier::TalentEaster);
+    }
+    None
+}
+
+pub fn time_of_day_tier_weights(minute_of_day: i32, has_active_festival: bool) -> [f64; 3] {
+    let mut w: [f64; 3] = if (690..810).contains(&minute_of_day) || (1050..1200).contains(&minute_of_day) {
+        [0.45, 0.40, 0.15]
+    } else if minute_of_day >= 1380 || minute_of_day < 390 {
+        [0.72, 0.18, 0.10]
+    } else {
+        [0.55, 0.30, 0.15]
+    };
+    if has_active_festival {
+        w[0] = (w[0] - 0.07).max(0.20);
+        w[2] += 0.07;
+    }
+    w
+}
+
+pub fn time_of_day_clip_weight(clip: &ClipMeta, minute_of_day: i32) -> f64 {
+    if (390..570).contains(&minute_of_day) {
+        if clip.tags.iter().any(|t| t == "wake")
+            || clip.id.contains("刷牙")
+            || clip.id.contains("伸懒腰")
+            || clip.id.contains("咖啡")
+            || clip.id.contains("早餐")
+        {
+            return 2.4;
+        }
+    } else if (690..810).contains(&minute_of_day) || (1050..1200).contains(&minute_of_day) {
+        if clip.category == "eat" {
+            return 2.5;
+        }
+    } else if (810..1050).contains(&minute_of_day) {
+        if ["咖啡", "奶茶", "可可", "布丁", "蛋糕", "饼干"]
+            .iter()
+            .any(|k| clip.id.contains(k))
+        {
+            return 1.6;
+        }
+    } else if minute_of_day >= 1380 || minute_of_day < 390 {
+        if ["沉眠", "打瞌睡", "瞌睡", "哈欠", "困倦", "揉眼", "熬夜", "浴袍"]
+            .iter()
+            .any(|k| clip.id.contains(k))
+        {
+            return 3.0;
+        }
+        if ["深蹲", "冲刺", "跳绳", "开合跳", "蹦迪", "街舞"]
+            .iter()
+            .any(|k| clip.id.contains(k))
+        {
+            return 0.4;
+        }
+    }
+    1.0
+}
+
+pub fn resolve_clip_for_emotion(
+    character: &CharacterRuntime,
+    bucket: crate::ai_voice::EmotionBucket,
+    history: &HashMap<String, i64>,
+    now_ms: i64,
+    rng: &mut Rng,
+) -> Option<ClipMeta> {
+    use crate::ai_voice::EmotionBucket;
+    let candidates: &[&str] = match bucket {
+        EmotionBucket::Happy => &[
+            "点击回应-开心跃动",
+            "开心跃动",
+            "工作状态-雀跃庆祝",
+            "狂喜原地跳",
+            "狂喜跃起",
+            "开心蹦跳",
+            "兴奋原地转",
+            "大笑",
+            "点击回应-挠痒咯咯笑",
+            "挠痒咯咯笑",
+            "鼓掌",
+            "轻快摇摆舞",
+        ],
+        EmotionBucket::Shy => &[
+            "点击回应-害羞惊讶",
+            "点击回应-害羞惊讶 v2",
+            "害羞惊讶",
+            "害羞捂脸偷看",
+            "害羞捂脸",
+            "低头害羞",
+            "尴尬抠手指",
+            "遮眼偷看",
+            "偷吃零食被抓住",
+        ],
+        EmotionBucket::Proud => &[
+            "得意炫耀转圈",
+            "骄傲昂首",
+            "得意叉腰仰头",
+            "得意炫耀",
+            "点击回应-挠痒咯咯笑",
+            "挠痒咯咯笑",
+            "竖大拇指",
+            "OK手势",
+            "优雅裙摆舞",
+            "优雅折扇舞",
+            "优雅猫耳娘舞",
+            "优雅女仆舞",
+            "优雅提裙旋舞",
+            "点击回应-开心跃动",
+            "开心跃动",
+        ],
+        EmotionBucket::Angry => &[
+            "点击回应-傲娇生气",
+            "傲娇生气",
+            "生气鼓腮跺脚",
+            "生气鼓腮",
+            "憋气鼓腮",
+            "委屈赌气",
+            "合扇敲掌·等待不耐烦",
+            "玩游戏气急败坏",
+            "无语扶额",
+            "扶额无语",
+            "嫉妒斜睨",
+            "用金色双马尾拍打地面",
+            "用蓬松紫色猫尾拍打地面",
+            "用蓬松狐尾拍打地面",
+            "斗篷披肩拍打地面",
+        ],
+        EmotionBucket::Sad => &[
+            "心疼捂胸口",
+            "感动抹泪",
+            "委屈撇嘴",
+            "哭泣",
+            "沮丧垂头v2",
+            "感动落泪",
+            "工作状态-垂头叹气冒汗",
+            "工作状态-垂头叹气冒汗 v2",
+            "余额-数金皱眉",
+            "余额-袋空如洗",
+            "无语叹气",
+            "双手摊开无奈",
+        ],
+        EmotionBucket::Surprised => &[
+            "被吓一跳",
+            "惊讶下巴掉",
+            "惊讶瞪眼",
+            "震惊僵住",
+            "惊吓后缩",
+            "紧张搓手抖",
+            "小鹿受惊",
+            "点击回应-害羞惊讶",
+            "点击回应-害羞惊讶 v2",
+            "害羞惊讶",
+        ],
+        EmotionBucket::Sleepy => &[
+            "哈欠连天",
+            "原地小憩沉眠",
+            "沙发打瞌睡",
+            "站着晃神打瞌睡",
+            "待机打哈欠",
+            "待机瞌睡点头",
+            "困倦揉眼",
+            "无聊打哈欠伸腰",
+            "超大伸懒腰",
+            "待机伸懒腰",
+            "打瞌睡被惊醒",
+            "打瞌睡被惊醒 v3",
+        ],
+        EmotionBucket::Thinking => &[
+            "工作状态-思考冒泡",
+            "深度思考碎碎念",
+            "深度思考碎碎念v4",
+            "深度思考走神",
+            "换装侦探服思考",
+            "咬手指思索",
+            "疑惑挠头",
+            "歪头好奇",
+            "工作状态-清点归档",
+            "碎碎念-发呆碎碎念",
+            "碎碎念-发呆碎碎念 v3",
+            "翻阅书册",
+            "书灵现世",
+            "拨算盘珠",
+        ],
+        EmotionBucket::Cheer => &[
+            "握拳打气",
+            "打气呐喊",
+            "举荧光棒应援",
+            "写代码",
+            "工作状态-忙碌点按",
+            "工作状态-雀跃庆祝",
+            "点击回应-元气挥手",
+            "元气挥手",
+            "OK手势",
+            "竖大拇指",
+            "点击回应-开心跃动",
+            "开心跃动",
+        ],
+        EmotionBucket::Affection => &[
+            "比心双手头顶v2",
+            "比心单手",
+            "飞吻",
+            "摘花送镜头",
+            "点击回应-元气挥手",
+            "元气挥手",
+            "挥手双手",
+            "淑女屈膝礼",
+            "提裙屈膝礼仪",
+            "猫耳娘屈膝礼仪",
+            "女仆屈膝礼仪",
+            "感激鞠躬",
+            "鞠躬轻",
+            "温柔注视",
+            "点击回应-开心跃动",
+            "开心跃动",
+        ],
+    };
+
+    let matched: Vec<&ClipMeta> = candidates
+        .iter()
+        .filter_map(|name| character.clip_map.get(*name).filter(|c| c.playable()))
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    let weights: Vec<f64> = matched
+        .iter()
+        .enumerate()
+        .map(|(idx, c)| {
+            let prio = if idx < 3 { 1.35 } else { 1.0 };
+            prio * selection_weight(history.get(&c.id).copied(), now_ms)
+        })
+        .collect();
+    pick_weighted_value(&matched, &weights, rng.next_f64()).map(|c| c.clone())
+}
+
 /// 待机选段（融合 2h 去重 × 本地节日/四季时令加权 × API 额度晴雨表余额档位）。
 pub fn pick_idle_with_context(
     character: &CharacterRuntime,
@@ -1073,6 +1403,12 @@ pub struct SchedulerCore {
     last_scene_switch_ms: i64,
     pending_scene: Option<AgentSceneSignal>,
     quota_remaining_pct: Option<f64>,
+    click_timestamps: Vec<i64>,
+    last_angry_ms: Option<i64>,
+    angry_voice_toggle: bool,
+    last_ambient_tier: Option<AmbientTier>,
+    last_ambient_category: Option<String>,
+    consecutive_same_tier: u8,
 }
 
 impl SchedulerCore {
@@ -1093,6 +1429,12 @@ impl SchedulerCore {
             last_scene_switch_ms: 0,
             pending_scene: None,
             quota_remaining_pct: None,
+            click_timestamps: Vec::new(),
+            last_angry_ms: None,
+            angry_voice_toggle: false,
+            last_ambient_tier: None,
+            last_ambient_category: None,
+            consecutive_same_tier: 0,
         }
     }
 
@@ -1110,6 +1452,12 @@ impl SchedulerCore {
         self.active_scene = None;
         self.last_scene_switch_ms = 0;
         self.pending_scene = None;
+        self.click_timestamps.clear();
+        self.last_angry_ms = None;
+        self.angry_voice_toggle = false;
+        self.last_ambient_tier = None;
+        self.last_ambient_category = None;
+        self.consecutive_same_tier = 0;
     }
 
     #[allow(dead_code)]
@@ -1133,7 +1481,47 @@ impl SchedulerCore {
                 self.begin_binding("idle", Priority::Idle, now_ms, false)
             }
             SchedulerEvent::UserClick { .. } => {
-                self.begin_binding("click", Priority::Click, now_ms, false)
+                self.click_timestamps
+                    .retain(|&ts| now_ms >= ts && now_ms - ts <= RAPID_CLICK_WINDOW_MS);
+                self.click_timestamps.push(now_ms);
+                if self.click_timestamps.len() < RAPID_CLICK_THRESHOLD {
+                    return Vec::new();
+                }
+                if self
+                    .last_angry_ms
+                    .is_some_and(|last| now_ms >= last && now_ms - last < ANGRY_COOLDOWN_MS)
+                {
+                    return Vec::new();
+                }
+                let Some(character) = self.character.as_ref() else {
+                    return Vec::new();
+                };
+                let Some(clip) = resolve_angry_clip(character, &self.history, now_ms, &mut self.rng)
+                else {
+                    return Vec::new();
+                };
+                self.click_timestamps.clear();
+                self.last_angry_ms = Some(now_ms);
+                let mirror = clip.mirrorable && self.rng.next_f64() < 0.35;
+                let mut request = request_from_clip(&clip, Priority::Click, mirror);
+                request.looped = false;
+                request.hold_loop = false;
+                let mut actions = self.try_start(request, now_ms, false);
+                if actions.iter().any(|a| matches!(a, Action::Play(_))) {
+                    self.angry_voice_toggle = !self.angry_voice_toggle;
+                    let scene_key = if self.angry_voice_toggle {
+                        "angry_1"
+                    } else {
+                        "angry_2"
+                    };
+                    actions.push(Action::Voice {
+                        scene_key: scene_key.to_string(),
+                        default_bubble: None,
+                        ttl_ms: 4_200,
+                        force: false,
+                    });
+                }
+                actions
             }
             SchedulerEvent::UserDragStart { .. } => {
                 self.dragging = true;
@@ -1360,8 +1748,10 @@ impl SchedulerCore {
                 self.work_mode = false;
                 self.work_phase = WorkPhase::None;
                 self.work_playlist_idx = 0;
-                if signal.activity == AgentActivityKind::Idle
-                    && !was_active
+                if matches!(
+                    signal.activity,
+                    AgentActivityKind::Idle | AgentActivityKind::ProcessOffline
+                ) && !was_active
                     && self.active_scene.is_none()
                 {
                     return Vec::new();
@@ -1369,7 +1759,10 @@ impl SchedulerCore {
             }
         }
 
-        if signal.activity == AgentActivityKind::Idle {
+        if matches!(
+            signal.activity,
+            AgentActivityKind::Idle | AgentActivityKind::ProcessOffline
+        ) {
             self.active_scene = None;
             self.pending_scene = None;
             return self.begin_binding("idle", Priority::Idle, now_ms, true);
@@ -1624,11 +2017,13 @@ impl SchedulerCore {
         }
         let should_replay = match current.priority {
             Priority::Drag => self.dragging,
-            Priority::Idle | Priority::ForegroundWork => current.looped && !self.dragging,
-            // 点击 / 聊天指令 / 告警等一次性互动段播完即回归当前工作锁定态或待机，绝不无限循环霸占状态机。
-            Priority::Click | Priority::Command | Priority::AgentAlert | Priority::Schedule => {
-                false
-            }
+            Priority::ForegroundWork => current.looped && !self.dragging,
+            // 待机、点击、聊天指令、告警等一次性段播完即轮换下一段，绝不无限循环锁死。
+            Priority::Idle
+            | Priority::Click
+            | Priority::Command
+            | Priority::AgentAlert
+            | Priority::Schedule => false,
         };
         let replay = if should_replay {
             Some((current.to_request(), current.scene))
@@ -1677,6 +2072,119 @@ impl SchedulerCore {
         self.begin_binding("idle", Priority::Idle, now_ms, true)
     }
 
+    fn pick_ambient_breathing(&mut self, now_ms: i64, exclude_id: Option<&str>) -> Option<ClipMeta> {
+        let character = self.character.as_ref()?;
+        let date_key = crate::stats::local_date_key(now_ms);
+        let minute_of_day = crate::stats::local_minute_of_day(now_ms);
+
+        let mut tier1: Vec<&ClipMeta> = Vec::new();
+        let mut tier2: Vec<&ClipMeta> = Vec::new();
+        let mut tier3: Vec<&ClipMeta> = Vec::new();
+        let mut has_active_festival = false;
+
+        for clip in &character.clips {
+            let Some(tier) = classify_ambient_tier(clip, &character.bindings.idle) else {
+                continue;
+            };
+            if festival_and_season_weight(&clip.id, &clip.category, date_key) >= 5.0 {
+                has_active_festival = true;
+            }
+            match tier {
+                AmbientTier::Rest => tier1.push(clip),
+                AmbientTier::DailyPlayEat => tier2.push(clip),
+                AmbientTier::TalentEaster => tier3.push(clip),
+            }
+        }
+
+        if tier1.is_empty() && tier2.is_empty() && tier3.is_empty() {
+            return pick_idle_with_context(
+                character,
+                &self.history,
+                now_ms,
+                &mut self.rng,
+                exclude_id,
+                self.quota_remaining_pct,
+            );
+        }
+
+        let mut tier_weights = time_of_day_tier_weights(minute_of_day, has_active_festival);
+        match self.last_ambient_tier {
+            Some(AmbientTier::TalentEaster) => tier_weights[2] *= 0.25,
+            Some(AmbientTier::DailyPlayEat) => tier_weights[1] *= 0.55,
+            Some(AmbientTier::Rest) if self.consecutive_same_tier >= 3 => {
+                tier_weights[1] *= 1.6;
+                tier_weights[2] *= 1.6;
+            }
+            _ => {}
+        }
+        if tier1.is_empty() {
+            tier_weights[0] = 0.0;
+        }
+        if tier2.is_empty() {
+            tier_weights[1] = 0.0;
+        }
+        if tier3.is_empty() {
+            tier_weights[2] = 0.0;
+        }
+
+        let tiers = [
+            AmbientTier::Rest,
+            AmbientTier::DailyPlayEat,
+            AmbientTier::TalentEaster,
+        ];
+        let chosen_tier = pick_weighted_value(&tiers, &tier_weights, self.rng.next_f64())
+            .unwrap_or(AmbientTier::Rest);
+        let mut pool = match chosen_tier {
+            AmbientTier::Rest => tier1,
+            AmbientTier::DailyPlayEat => tier2,
+            AmbientTier::TalentEaster => tier3,
+        };
+        if let Some(ex) = exclude_id {
+            if pool.len() > 1 {
+                let filtered: Vec<&ClipMeta> = pool.iter().copied().filter(|c| c.id != ex).collect();
+                if !filtered.is_empty() {
+                    pool = filtered;
+                }
+            }
+        }
+
+        let distinct_cats = pool
+            .iter()
+            .map(|c| c.category.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let weights: Vec<f64> = pool
+            .iter()
+            .map(|clip| {
+                let base = selection_weight(self.history.get(&clip.id).copied(), now_ms);
+                let fest = festival_and_season_weight(&clip.id, &clip.category, date_key);
+                let quota = quota_balance_idle_weight(&clip.id, self.quota_remaining_pct);
+                let tod = time_of_day_clip_weight(clip, minute_of_day);
+                let cat_pen = if distinct_cats > 1
+                    && self
+                        .last_ambient_category
+                        .as_deref()
+                        .is_some_and(|cat| cat == clip.category)
+                {
+                    0.25
+                } else {
+                    1.0
+                };
+                base * fest * quota * tod * cat_pen
+            })
+            .collect();
+
+        let picked = pick_weighted_value(&pool, &weights, self.rng.next_f64())?.clone();
+        if self.last_ambient_tier == Some(chosen_tier) {
+            self.consecutive_same_tier = self.consecutive_same_tier.saturating_add(1);
+        } else {
+            self.last_ambient_tier = Some(chosen_tier);
+            self.consecutive_same_tier = 1;
+        }
+        self.last_ambient_category = Some(picked.category.clone());
+        Some(picked)
+    }
+
     fn begin_binding(
         &mut self,
         key: &str,
@@ -1684,27 +2192,20 @@ impl SchedulerCore {
         now_ms: i64,
         force: bool,
     ) -> Vec<Action> {
-        let Some(character) = self.character.as_ref() else {
-            return Vec::new();
-        };
-        let exclude = self.current.as_ref().map(|c| c.clip_id.as_str());
+        let exclude = self.current.as_ref().map(|c| c.clip_id.as_str()).map(str::to_string);
         let clip = if key == "idle" {
-            pick_idle_with_context(
-                character,
-                &self.history,
-                now_ms,
-                &mut self.rng,
-                exclude,
-                self.quota_remaining_pct,
-            )
+            self.pick_ambient_breathing(now_ms, exclude.as_deref())
         } else {
+            let Some(character) = self.character.as_ref() else {
+                return Vec::new();
+            };
             pick_for_binding_excluding(
                 character,
                 key,
                 &self.history,
                 now_ms,
                 &mut self.rng,
-                exclude,
+                exclude.as_deref(),
             )
         };
         let Some(clip) = clip else {
@@ -1720,9 +2221,10 @@ impl SchedulerCore {
         if priority == Priority::Drag {
             // 拖拽悬空段无论原 meta 是否标 loop，均强制循环直至松手。
             request.looped = true;
-        } else if priority == Priority::Click {
-            // 点击反应段只播一遍，播完自然回归待机，不锁死低优先级调度。
+        } else if matches!(priority, Priority::Click | Priority::Idle) {
+            // 点击反应与非工作态呼吸待机段只播一遍，播完自然轮换下一段，不锁死调度。
             request.looped = false;
+            request.hold_loop = false;
         }
         self.try_start(request, now_ms, force)
     }
@@ -1963,6 +2465,17 @@ mod tests {
         })
     }
 
+    fn trigger_rapid_click(core: &mut SchedulerCore, base_ms: i64) -> Vec<Action> {
+        let mut last = Vec::new();
+        for i in 0..RAPID_CLICK_THRESHOLD {
+            last = core.on_event(
+                SchedulerEvent::UserClick { x: 0.0, y: 0.0 },
+                base_ms + (i as i64) * 150,
+            );
+        }
+        last
+    }
+
     #[test]
     fn click_preempts_idle() {
         let mut core = SchedulerCore::new(1);
@@ -1971,10 +2484,17 @@ mod tests {
             play_id(&core.on_event(SchedulerEvent::AppReady, 0)),
             Some("idle1")
         );
-        assert_eq!(
-            play_id(&core.on_event(SchedulerEvent::UserClick { x: 0.0, y: 0.0 }, 100)),
-            Some("click1")
-        );
+        // 普通单击不再切换动画
+        assert!(core
+            .on_event(SchedulerEvent::UserClick { x: 0.0, y: 0.0 }, 100)
+            .is_empty());
+        // 3s 内连点 5 次触发专属生气动画 + angry_1 语音
+        let rapid = trigger_rapid_click(&mut core, 4_000);
+        assert_eq!(play_id(&rapid), Some("click1"));
+        assert!(rapid.iter().any(|a| matches!(
+            a,
+            Action::Voice { scene_key, .. } if scene_key == "angry_1"
+        )));
     }
 
     #[test]
@@ -2039,7 +2559,7 @@ mod tests {
             Some("idle1")
         );
         assert_eq!(
-            play_id(&core.on_event(SchedulerEvent::UserClick { x: 0.0, y: 0.0 }, 100)),
+            play_id(&trigger_rapid_click(&mut core, 100)),
             Some("click1")
         );
         assert!(core
@@ -2277,18 +2797,21 @@ mod tests {
         core.set_character(character, HashMap::new());
         core.on_event(SchedulerEvent::AppReady, 0);
 
-        let first = play_id(&core.on_event(SchedulerEvent::UserClick { x: 0.0, y: 0.0 }, 200))
-            .map(|s| s.to_string());
+        let first = play_id(&trigger_rapid_click(&mut core, 200)).map(|s| s.to_string());
         assert!(first.as_deref() == Some("click1") || first.as_deref() == Some("click2"));
 
-        // 连续点击（超过 120ms 防抖，但远小于 3000ms interruptAfterMs）必须立即切到另一段。
-        let second = play_id(&core.on_event(SchedulerEvent::UserClick { x: 0.0, y: 0.0 }, 500))
-            .map(|s| s.to_string());
-        assert!(second.is_some());
-        assert_ne!(second, first);
+        // 冷却期内再次连点不重复触发；超过 14s 冷却后可再次触发 angry_2 语音。
+        assert!(trigger_rapid_click(&mut core, 2_000).is_empty());
+        let second_actions = trigger_rapid_click(&mut core, 16_000);
+        let second = play_id(&second_actions).map(|s| s.to_string());
+        assert!(second.as_deref() == Some("click1") || second.as_deref() == Some("click2"));
+        assert!(second_actions.iter().any(|a| matches!(
+            a,
+            Action::Voice { scene_key, .. } if scene_key == "angry_2"
+        )));
 
         // 点击段播放结束后回到待机，不无限循环。
-        let after_end = core.on_event(SchedulerEvent::ClipEnded { clip_id: second }, 12_000);
+        let after_end = core.on_event(SchedulerEvent::ClipEnded { clip_id: second }, 28_000);
         assert_eq!(play_id(&after_end), Some("idle1"));
     }
 
@@ -2396,9 +2919,9 @@ mod tests {
             Some("写代码")
         );
 
-        // 点击反应播完后也恢复工作锁定态，绝不掉回 idle。
+        // 高频连点生气反应播完后也恢复工作锁定态，绝不掉回 idle。
         assert_eq!(
-            play_id(&core.on_event(SchedulerEvent::UserClick { x: 0.0, y: 0.0 }, 1_000)),
+            play_id(&trigger_rapid_click(&mut core, 1_000)),
             Some("click1")
         );
         assert_eq!(
@@ -2902,5 +3425,144 @@ mod tests {
         let (tight_cands, tight_msg) = quota_barometer_candidates(18.0);
         assert!(tight_cands.contains(&"余额-数金皱眉"));
         assert!(tight_msg.contains("18%"));
+    }
+
+    #[test]
+    fn process_offline_does_not_hold_loop_and_breathes_on_clip_end() {
+        let mut core = SchedulerCore::new(71);
+        let mut ch = runtime();
+        let mut idle2 = clip("idle2", 0);
+        idle2.category = "idle".to_string();
+        ch.clips.push(idle2.clone());
+        ch.clip_map.insert("idle2".to_string(), idle2);
+        ch.bindings.idle.push("idle2".to_string());
+        core.set_character(ch, HashMap::new());
+
+        let start = core.on_event(SchedulerEvent::AppReady, 0);
+        let first_req = start.iter().find_map(|a| match a {
+            Action::Play(r) => Some(r),
+            _ => None,
+        });
+        assert!(first_req.is_some_and(|r| !r.hold_loop && !r.looped));
+
+        let offline = core.on_event(
+            SchedulerEvent::AgentScene(AgentSceneSignal {
+                status: TelemetryStatus::Offline,
+                activity: AgentActivityKind::ProcessOffline,
+                detail: None,
+                bubble: None,
+            }),
+            500,
+        );
+        assert!(offline.is_empty());
+
+        let ended = core.on_event(
+            SchedulerEvent::ClipEnded {
+                clip_id: core.current_clip().map(str::to_string),
+            },
+            10_500,
+        );
+        assert!(play_id(&ended).is_some());
+    }
+
+    #[test]
+    fn ambient_three_tier_distribution_and_category_anti_repeat() {
+        let mut core = SchedulerCore::new(83);
+        let mut ch = runtime();
+        for (id, cat) in [
+            ("待机呼吸休闲", "idle"),
+            ("东张西望", "idle"),
+            ("晨间刷牙", "daily"),
+            ("撸猫", "play"),
+            ("吃白饭", "eat"),
+            ("可爱宅舞", "talent"),
+        ] {
+            let mut c = clip(id, 0);
+            c.category = cat.to_string();
+            ch.clips.push(c.clone());
+            ch.clip_map.insert(id.to_string(), c);
+        }
+        core.set_character(ch, HashMap::new());
+        core.on_event(SchedulerEvent::AppReady, 0);
+
+        let mut seen_tiers = std::collections::HashSet::new();
+        let mut now = 10_000i64;
+        for _ in 0..30 {
+            let cur = core.current_clip().map(str::to_string);
+            let acts = core.on_event(SchedulerEvent::ClipEnded { clip_id: cur }, now);
+            if let Some(id) = play_id(&acts) {
+                if let Some(meta) = core.character.as_ref().and_then(|c| c.clip_map.get(id)) {
+                    if let Some(tier) = classify_ambient_tier(meta, &core.character.as_ref().unwrap().bindings.idle) {
+                        seen_tiers.insert(match tier {
+                            AmbientTier::Rest => 1,
+                            AmbientTier::DailyPlayEat => 2,
+                            AmbientTier::TalentEaster => 3,
+                        });
+                    }
+                }
+            }
+            now += 10_500;
+        }
+        assert!(seen_tiers.len() >= 2);
+    }
+
+    #[test]
+    fn all_eight_character_archetypes_resolve_angry_and_ten_emotion_buckets() {
+        use crate::ai_voice::EmotionBucket;
+        let mut ch = runtime();
+        let sample_ids = [
+            "点击回应-傲娇生气",
+            "傲娇生气",
+            "生气鼓腮跺脚",
+            "生气鼓腮",
+            "点击回应-开心跃动",
+            "开心跃动",
+            "狂喜原地跳",
+            "点击回应-害羞惊讶",
+            "害羞惊讶",
+            "害羞捂脸偷看",
+            "低头害羞",
+            "得意炫耀转圈",
+            "骄傲昂首",
+            "心疼捂胸口",
+            "工作状态-垂头叹气冒汗",
+            "被吓一跳",
+            "惊讶下巴掉",
+            "哈欠连天",
+            "沙发打瞌睡",
+            "工作状态-思考冒泡",
+            "换装侦探服思考",
+            "握拳打气",
+            "写代码",
+            "比心双手头顶v2",
+            "点击回应-元气挥手",
+            "元气挥手",
+        ];
+        for id in sample_ids {
+            let c = clip(id, 0);
+            ch.clips.push(c.clone());
+            ch.clip_map.insert(id.to_string(), c);
+        }
+        let history = HashMap::new();
+        let mut rng = Rng::new(97);
+        assert!(resolve_angry_clip(&ch, &history, 1_000, &mut rng).is_some());
+
+        for bucket in [
+            EmotionBucket::Happy,
+            EmotionBucket::Shy,
+            EmotionBucket::Proud,
+            EmotionBucket::Angry,
+            EmotionBucket::Sad,
+            EmotionBucket::Surprised,
+            EmotionBucket::Sleepy,
+            EmotionBucket::Thinking,
+            EmotionBucket::Cheer,
+            EmotionBucket::Affection,
+        ] {
+            assert!(
+                resolve_clip_for_emotion(&ch, bucket, &history, 1_000, &mut rng).is_some(),
+                "failed to resolve {bucket:?}"
+            );
+        }
     }
 }

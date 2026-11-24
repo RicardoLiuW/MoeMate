@@ -93,6 +93,88 @@ pub fn foreground_is_work() -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserNotificationState {
+    AcceptsNotifications,
+    NotPresent,
+    BusyOrFullscreen,
+    PresentationMode,
+    QuietTime,
+    Unknown,
+}
+
+pub fn should_suppress_for_notification_state(state: UserNotificationState) -> bool {
+    matches!(
+        state,
+        UserNotificationState::NotPresent
+            | UserNotificationState::BusyOrFullscreen
+            | UserNotificationState::PresentationMode
+            | UserNotificationState::QuietTime
+    )
+}
+
+#[cfg(windows)]
+pub fn query_user_notification_state() -> UserNotificationState {
+    use windows_sys::Win32::UI::Shell::{
+        SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_ACCEPTS_NOTIFICATIONS,
+        QUNS_APP, QUNS_BUSY, QUNS_NOT_PRESENT, QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME,
+        QUNS_RUNNING_D3D_FULL_SCREEN,
+    };
+
+    let mut state: QUERY_USER_NOTIFICATION_STATE = 0;
+    let hr = unsafe { SHQueryUserNotificationState(&mut state) };
+    if hr != 0 {
+        return UserNotificationState::Unknown;
+    }
+    match state {
+        s if s == QUNS_ACCEPTS_NOTIFICATIONS || s == QUNS_APP => {
+            UserNotificationState::AcceptsNotifications
+        }
+        s if s == QUNS_NOT_PRESENT => UserNotificationState::NotPresent,
+        s if s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN => {
+            UserNotificationState::BusyOrFullscreen
+        }
+        s if s == QUNS_PRESENTATION_MODE => UserNotificationState::PresentationMode,
+        s if s == QUNS_QUIET_TIME => UserNotificationState::QuietTime,
+        _ => UserNotificationState::Unknown,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn query_user_notification_state() -> UserNotificationState {
+    UserNotificationState::AcceptsNotifications
+}
+
+pub fn is_user_in_fullscreen_or_dnd() -> bool {
+    should_suppress_for_notification_state(query_user_notification_state())
+}
+
+#[cfg(windows)]
+pub fn idle_input_ms() -> Option<u64> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetTickCount() -> u32;
+    }
+
+    let mut lii = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    let ok = unsafe { GetLastInputInfo(&mut lii) };
+    if ok == 0 {
+        return None;
+    }
+    let now_tick = unsafe { GetTickCount() };
+    Some(now_tick.wrapping_sub(lii.dwTime) as u64)
+}
+
+#[cfg(not(windows))]
+pub fn idle_input_ms() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +200,27 @@ mod tests {
         assert!(!process_name_matches("explorer.exe"));
         assert!(!process_name_matches("not-code.exe"));
         assert!(!process_name_matches(""));
+    }
+
+    #[test]
+    fn should_suppress_for_notification_state_covers_all_variants() {
+        assert!(!should_suppress_for_notification_state(
+            UserNotificationState::AcceptsNotifications
+        ));
+        assert!(!should_suppress_for_notification_state(
+            UserNotificationState::Unknown
+        ));
+        assert!(should_suppress_for_notification_state(
+            UserNotificationState::NotPresent
+        ));
+        assert!(should_suppress_for_notification_state(
+            UserNotificationState::BusyOrFullscreen
+        ));
+        assert!(should_suppress_for_notification_state(
+            UserNotificationState::PresentationMode
+        ));
+        assert!(should_suppress_for_notification_state(
+            UserNotificationState::QuietTime
+        ));
     }
 }

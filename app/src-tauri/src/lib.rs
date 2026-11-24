@@ -19,6 +19,7 @@
 
 mod ai_voice;
 mod assets_mgr;
+mod companion;
 mod db;
 mod foreground;
 mod gpt_sovits;
@@ -30,6 +31,7 @@ mod scheduler;
 mod state;
 mod stats;
 pub mod telemetry;
+mod vram;
 mod window_layout;
 
 use std::collections::HashMap;
@@ -157,16 +159,37 @@ pub(crate) fn dispatch_daily_scene_voice(
     force: bool,
 ) {
     let root = assets_root();
-    let manifest_key = if scene_key == "pomodoro_done" {
-        "done"
-    } else {
-        scene_key
+    let fallback_key = match scene_key {
+        "pomodoro_done" | "done_2" => Some("done"),
+        "work_start_2" => Some("work_start"),
+        _ => None,
     };
-    let manifest_line =
-        ai_voice::load_voice_manifest_scene(&root, char_id, manifest_key).map(|(line, _)| line);
+    let cfg = shared.chat_ai_config();
+    if !cfg.tts_enabled {
+        return;
+    }
+
+    let manifest_line = ai_voice::load_voice_manifest_scene_for_lang(
+        &root,
+        char_id,
+        scene_key,
+        &cfg.builtin_voice_lang,
+    )
+    .or_else(|| {
+        fallback_key.and_then(|fk| {
+            ai_voice::load_voice_manifest_scene_for_lang(
+                &root,
+                char_id,
+                fk,
+                &cfg.builtin_voice_lang,
+            )
+        })
+    })
+    .map(|(line, _)| line);
     let zh_line = default_bubble
         .map(str::to_string)
         .or(manifest_line)
+        .or_else(|| ai_voice::builtin_zh_voice_for_scene(char_id, scene_key).map(str::to_string))
         .unwrap_or_default();
 
     if !zh_line.is_empty() {
@@ -176,10 +199,8 @@ pub(crate) fn dispatch_daily_scene_voice(
     if shared.snapshot().muted {
         return;
     }
-    let cfg = shared.chat_ai_config();
-    if !cfg.tts_enabled {
-        return;
-    }
+
+    shared.mark_any_voice_played(now_ms());
 
     let b_root = base_root();
     let c_dir = voice_cache_dir(shared);
@@ -274,7 +295,7 @@ fn char_switch(char_id: String, shared: State<'_, Shared>) -> Result<CharState, 
     let _ = shared.inner.app.emit("pet_char_switched", &char_state);
 
     let cfg = shared.chat_ai_config();
-    if cfg.tts_mode == "gpt_sovits" {
+    if cfg.tts_mode == "gpt_sovits" && ai_voice::normalize_vram_mode(&cfg.vram_mode) != "zero_vram" {
         let rt = shared.inner.gpt_sovits.clone();
         let gpt_cfg = cfg.gpt_sovits;
         let cid = char_id.clone();
@@ -299,8 +320,6 @@ fn pet_state_get(shared: State<'_, Shared>) -> Result<PetState, String> {
         // 前端真正开始拉状态时补发 APP_READY，避免 setup 早于监听注册。
         shared.send(SchedulerEvent::AppReady);
     }
-    // 首个 play 可能已经发出但前端还没 listen；延迟补播当前段。
-    shared.schedule_boot_replay();
     Ok(shared.snapshot())
 }
 
@@ -316,6 +335,7 @@ fn pet_interact(
     let now = now_ms();
     let mut bubble: Option<String> = None;
     let mut drag_ended_now = false;
+    let mut was_edge_docked = false;
 
     match kind.as_str() {
         "click" => {
@@ -329,7 +349,8 @@ fn pet_interact(
                 pet.stats.mood = clamp_stat(pet.stats.mood + 2.0);
                 pet.stats.affinity = clamp_stat(pet.stats.affinity + 1.0);
             }
-            if shared.edge_side().is_some() {
+            was_edge_docked = shared.edge_side().is_some();
+            if was_edge_docked {
                 window_layout::undock_from_edge(&shared, &app);
             }
         }
@@ -421,15 +442,8 @@ fn pet_interact(
 
     match kind.as_str() {
         "click" => {
-            shared.send(SchedulerEvent::UserClick { x, y });
-            if !shared.snapshot().muted
-                && shared.chat_ai_config().tts_enabled
-                && shared.try_claim_click_voice(now)
-            {
-                if let Some(ch) = shared.character_snapshot() {
-                    let scene_key = if (now / 1000) % 2 == 0 { "click_1" } else { "click_2" };
-                    dispatch_daily_scene_voice(&shared, &ch.id, scene_key, None, 3400, false);
-                }
+            if !was_edge_docked {
+                shared.send(SchedulerEvent::UserClick { x, y });
             }
         }
         "dragStart" => {
@@ -726,6 +740,122 @@ fn settings_set(
                 .save_setting("muted", &Value::Bool(next_muted));
             let _ = app.emit("pet_muted", next_muted);
             let _ = app.emit("pet_chat_config", &cfg);
+            if ai_voice::normalize_vram_mode(&cfg.vram_mode) == "zero_vram" {
+                let gs_cfg = cfg.gpt_sovits.clone();
+                let rt = shared.inner.gpt_sovits.clone();
+                let app_handle = app.clone();
+                let b_root = base_root();
+                std::thread::spawn(move || {
+                    gpt_sovits::stop_service(&gs_cfg.api_url, &rt);
+                    let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
+                    let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                    let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
+                    let _ = app_handle.emit_to("settings", "pet_vram_status", &vram_st);
+                });
+            }
+        }
+        "vramMode" => {
+            let mode = value
+                .as_str()
+                .ok_or_else(|| "vramMode 必须是字符串".to_string())?;
+            let norm = ai_voice::normalize_vram_mode(mode).to_string();
+            let mut cfg = shared.chat_ai_config();
+            cfg.vram_mode = norm.clone();
+            if let Ok(val) = serde_json::to_value(&cfg) {
+                shared.set_cached_setting("chatAiConfig", val.clone());
+                let _ = shared.inner.db.save_setting("chatAiConfig", &val);
+            }
+            let _ = app.emit("pet_chat_config", &cfg);
+            if norm == "zero_vram" {
+                let gs_cfg = cfg.gpt_sovits.clone();
+                let rt = shared.inner.gpt_sovits.clone();
+                let app_handle = app.clone();
+                let b_root = base_root();
+                std::thread::spawn(move || {
+                    gpt_sovits::stop_service(&gs_cfg.api_url, &rt);
+                    let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
+                    let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                    let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
+                    let _ = app_handle.emit_to("settings", "pet_vram_status", &vram_st);
+                });
+            }
+        }
+        "builtinVoiceLang" => {
+            let lang = value
+                .as_str()
+                .ok_or_else(|| "builtinVoiceLang 必须是字符串".to_string())?;
+            let norm = ai_voice::normalize_builtin_voice_lang(lang).to_string();
+            let mut cfg = shared.chat_ai_config();
+            cfg.builtin_voice_lang = norm;
+            if let Ok(val) = serde_json::to_value(&cfg) {
+                shared.set_cached_setting("chatAiConfig", val.clone());
+                let _ = shared.inner.db.save_setting("chatAiConfig", &val);
+            }
+            let _ = app.emit("pet_chat_config", &cfg);
+        }
+        "ideVoiceEnabled" => {
+            let enabled = value
+                .as_bool()
+                .ok_or_else(|| "ideVoiceEnabled 必须是布尔值".to_string())?;
+            let mut cfg = shared.chat_ai_config();
+            cfg.ide_voice_enabled = enabled;
+            if let Ok(val) = serde_json::to_value(&cfg) {
+                shared.set_cached_setting("chatAiConfig", val.clone());
+                let _ = shared.inner.db.save_setting("chatAiConfig", &val);
+            }
+            let _ = app.emit("pet_chat_config", &cfg);
+        }
+        "companionVoiceMode" => {
+            let mode = value
+                .as_str()
+                .ok_or_else(|| "companionVoiceMode 必须是字符串".to_string())?;
+            let norm = ai_voice::normalize_companion_voice_mode(mode).to_string();
+            let mut cfg = shared.chat_ai_config();
+            cfg.companion_voice_mode = norm;
+            if let Ok(val) = serde_json::to_value(&cfg) {
+                shared.set_cached_setting("chatAiConfig", val.clone());
+                let _ = shared.inner.db.save_setting("chatAiConfig", &val);
+            }
+            let _ = app.emit("pet_chat_config", &cfg);
+        }
+        "clickSfxEnabled" => {
+            let enabled = value
+                .as_bool()
+                .ok_or_else(|| "clickSfxEnabled 必须是布尔值".to_string())?;
+            let mut cfg = shared.chat_ai_config();
+            cfg.click_sfx_enabled = enabled;
+            if let Ok(val) = serde_json::to_value(&cfg) {
+                shared.set_cached_setting("chatAiConfig", val.clone());
+                let _ = shared.inner.db.save_setting("chatAiConfig", &val);
+            }
+            let _ = app.emit("pet_chat_config", &cfg);
+        }
+        "vramStatus" => {
+            let gs_cfg = shared.chat_ai_config().gpt_sovits;
+            let rt = shared.inner.gpt_sovits.clone();
+            let app_handle = app.clone();
+            std::thread::spawn(move || {
+                let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_vram_status", &vram_st);
+            });
+        }
+        "vramRelease" => {
+            let gs_cfg = shared.chat_ai_config().gpt_sovits;
+            let rt = shared.inner.gpt_sovits.clone();
+            let app_handle = app.clone();
+            let b_root = base_root();
+            std::thread::spawn(move || {
+                gpt_sovits::stop_service(&gs_cfg.api_url, &rt);
+                let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_vram_status", &vram_st);
+                let _ = app_handle.emit_to(
+                    "settings",
+                    "pet_tts_status",
+                    serde_json::json!({ "ok": true, "message": "已释放 MoeMate 语音引擎显存" }),
+                );
+            });
         }
         "ttsPreview" => {
             let mut cfg = shared.chat_ai_config();
@@ -750,6 +880,9 @@ fn settings_set(
                 }
                 if let Some(m) = value.get("ttsMode").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
                     cfg.tts_mode = m.to_string();
+                }
+                if let Some(bl) = value.get("builtinVoiceLang").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                    cfg.builtin_voice_lang = ai_voice::normalize_builtin_voice_lang(bl).to_string();
                 }
                 if let Some(k) = value.get("azureSpeechKey").and_then(Value::as_str) {
                     cfg.azure_speech_key = k.trim().to_string();
@@ -1122,6 +1255,15 @@ fn settings_set(
                         &shared.inner.assets_rt,
                     );
                     let _ = app.emit_to("settings", "pet_assets_status", &assets_st);
+                    {
+                        let gs_cfg = shared.chat_ai_config().gpt_sovits;
+                        let rt = shared.inner.gpt_sovits.clone();
+                        let app_h = app.clone();
+                        std::thread::spawn(move || {
+                            let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
+                            let _ = app_h.emit_to("settings", "pet_vram_status", &vram_st);
+                        });
+                    }
                     if let Some(tab) = requested_tab {
                         let _ = app.emit_to("settings", "pet_open_settings_tab", tab);
                     }
@@ -1159,6 +1301,15 @@ fn settings_set(
                 &shared.inner.assets_rt,
             );
             let _ = app.emit_to("settings", "pet_assets_status", &assets_st);
+            {
+                let gs_cfg = shared.chat_ai_config().gpt_sovits;
+                let rt = shared.inner.gpt_sovits.clone();
+                let app_h = app.clone();
+                std::thread::spawn(move || {
+                    let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
+                    let _ = app_h.emit_to("settings", "pet_vram_status", &vram_st);
+                });
+            }
         }
         "chatClearHistory" => {
             shared.clear_chat_history();
@@ -1209,6 +1360,13 @@ fn settings_set(
             | "assetsDownloadConfig"
             | "pomodoroControl"
             | "globalHotkey"
+            | "vramStatus"
+            | "vramRelease"
+            | "vramMode"
+            | "builtinVoiceLang"
+            | "ideVoiceEnabled"
+            | "companionVoiceMode"
+            | "clickSfxEnabled"
     );
     if persist_to_db {
         shared.set_cached_setting(&key, value.clone());
@@ -1317,16 +1475,52 @@ async fn chat_send(
     let reply_now = now_ms();
     let mut rng = Rng::new((reply_now as u64) ^ (trimmed.len() as u64) ^ 0x5EED_5EED);
 
+    let cached_ja = ai_voice::get_cached_ja_voice_script(&bubble);
+    let reply_emotion = ai_voice::detect_reply_emotion(&bubble, cached_ja.as_deref(), &trimmed);
+
     let mut clip = None;
-    if let Some(ref hint) = action_hint {
-        match hint.as_str() {
-            "click" | "eat" | "sleep" | "work" | "idle" => {
-                clip = pick_for_binding(&character, hint, &history, reply_now, &mut rng);
+    let concrete_action = matches!(action_hint.as_deref(), Some("eat" | "talent" | "work"));
+    if concrete_action {
+        if let Some(ref hint) = action_hint {
+            match hint.as_str() {
+                "eat" | "work" => {
+                    clip = pick_for_binding(&character, hint, &history, reply_now, &mut rng);
+                }
+                "talent" => {
+                    clip = pick_by_category(&character, &["talent"], &history, reply_now, &mut rng);
+                }
+                _ => {}
             }
-            "talent" | "emotion" | "chatter" => {
-                clip = pick_by_category(&character, &[hint.as_str()], &history, reply_now, &mut rng);
+        }
+    } else if action_hint.as_deref() == Some("sleep") {
+        clip = scheduler::resolve_clip_for_emotion(
+            &character,
+            ai_voice::EmotionBucket::Sleepy,
+            &history,
+            reply_now,
+            &mut rng,
+        );
+    } else if let Some(emo) = reply_emotion {
+        clip = scheduler::resolve_clip_for_emotion(
+            &character,
+            emo.bucket,
+            &history,
+            reply_now,
+            &mut rng,
+        );
+    }
+
+    if clip.is_none() {
+        if let Some(ref hint) = action_hint {
+            match hint.as_str() {
+                "click" | "eat" | "sleep" | "work" | "idle" => {
+                    clip = pick_for_binding(&character, hint, &history, reply_now, &mut rng);
+                }
+                "talent" | "emotion" | "chatter" => {
+                    clip = pick_by_category(&character, &[hint.as_str()], &history, reply_now, &mut rng);
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     if clip.is_none() {
@@ -1387,7 +1581,13 @@ async fn chat_send(
         let char_id_clone = character.id.clone();
         let user_clone = trimmed;
         let reply_clone = bubble.clone();
-        let binding_hint = action_hint.unwrap_or(intent_binding);
+        let binding_hint = if concrete_action {
+            action_hint.unwrap_or(intent_binding)
+        } else if let Some(emo) = reply_emotion {
+            emo.bucket.voice_scene_key().to_string()
+        } else {
+            action_hint.unwrap_or(intent_binding)
+        };
         let app_handle = app.clone();
         let shared_clone = (*shared).clone();
         std::thread::spawn(move || {
@@ -1407,6 +1607,7 @@ async fn chat_send(
                     if let Some(hint) = fallback_hint {
                         shared_clone.emit_bubble(format!("{reply_clone}（{hint}）"), 5500);
                     }
+                    shared_clone.mark_any_voice_played(now_ms());
                     let _ = app_handle.emit_to("main", "pet_tts", &payload);
                 }
                 Err(reason) => {
@@ -1500,6 +1701,23 @@ fn spawn_scheduler(shared: Shared, receiver: mpsc::Receiver<SchedulerEvent>) {
                 match action {
                     Action::Play(request) => execute_play(&shared, request),
                     Action::Bubble { text, ttl_ms } => shared.emit_bubble(text, ttl_ms),
+                    Action::Voice {
+                        scene_key,
+                        default_bubble,
+                        ttl_ms,
+                        force,
+                    } => {
+                        if let Some(ch) = shared.character_snapshot() {
+                            dispatch_daily_scene_voice(
+                                &shared,
+                                &ch.id,
+                                &scene_key,
+                                default_bubble.as_deref(),
+                                ttl_ms,
+                                force,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1535,6 +1753,44 @@ fn execute_play(shared: &Shared, request: PlayRequest) {
             hold_loop: request.hold_loop,
         },
     );
+}
+
+fn spawn_vram_idle_guard(shared: Shared) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(30));
+        if shared.is_quitting() {
+            break;
+        }
+        let cfg = shared.chat_ai_config();
+        if ai_voice::normalize_vram_mode(&cfg.vram_mode) != "balanced" {
+            continue;
+        }
+        let last_used = shared.inner.gpt_sovits.last_used();
+        if last_used <= 0 {
+            continue;
+        }
+        let timeout_ms = (cfg.vram_auto_unload_minutes.clamp(1, 60) as i64) * 60_000;
+        if now_ms() - last_used < timeout_ms {
+            continue;
+        }
+        if gpt_sovits::check_api_health(&cfg.gpt_sovits.api_url) {
+            gpt_sovits::stop_service(&cfg.gpt_sovits.api_url, &shared.inner.gpt_sovits);
+            let status = gpt_sovits::inspect_status(
+                &base_root(),
+                &cfg.gpt_sovits,
+                &shared.inner.gpt_sovits,
+            );
+            let _ = shared
+                .inner
+                .app
+                .emit_to("settings", "pet_gpt_sovits_status", &status);
+            let vram_st = vram::inspect_vram_status(&cfg.gpt_sovits, &shared.inner.gpt_sovits);
+            let _ = shared
+                .inner
+                .app
+                .emit_to("settings", "pet_vram_status", &vram_st);
+        }
+    });
 }
 
 fn spawn_stats_loop(shared: Shared) {
@@ -1608,10 +1864,12 @@ fn spawn_foreground_loop(shared: Shared) {
     std::thread::spawn(move || {
         let mut last: Option<bool> = None;
         let mut sedentary = SedentaryTracker::new();
+        let mut companion_throttle = companion::CompanionVoiceThrottle::new(now_ms());
         loop {
             if shared.is_quitting() {
                 break;
             }
+            let now = now_ms();
             let is_work = foreground::foreground_is_work();
             if last != Some(is_work) {
                 last = Some(is_work);
@@ -1636,12 +1894,34 @@ fn spawn_foreground_loop(shared: Shared) {
                 tele_status,
                 TelemetryStatus::Idle | TelemetryStatus::Offline
             );
-            if sedentary.tick(now_ms(), is_work || agent_active, agent_idle) {
+            let dnd = foreground::is_user_in_fullscreen_or_dnd();
+            if sedentary.tick(now, is_work || agent_active, agent_idle) {
                 let default_line = "已经连续专注写代码 45 分钟啦，起来活动一下、喝口水吧～";
+                if !dnd {
+                    if let Some(ch) = shared.character_snapshot() {
+                        dispatch_daily_scene_voice(&shared, &ch.id, "tired", None, 6000, false);
+                    } else {
+                        shared.emit_bubble(default_line.to_string(), 6000);
+                    }
+                }
+            }
+
+            let cfg = shared.chat_ai_config();
+            let pet_muted = shared.snapshot().muted;
+            let mode = ai_voice::normalize_companion_voice_mode(&cfg.companion_voice_mode);
+            if let Some(scene_key) = companion_throttle.tick(companion::CompanionTickContext {
+                now_ms: now,
+                mode,
+                muted_or_tts_off: pet_muted || !cfg.tts_enabled,
+                dnd_or_fullscreen: dnd,
+                idle_input_ms: foreground::idle_input_ms(),
+                agent_busy: tele_status.is_agent_active(),
+                dragging: shared.drag_fast().is_dragging(),
+                last_any_voice_ms: shared.last_any_voice_ms(),
+                local_minute_of_day: stats::local_minute_of_day(now),
+            }) {
                 if let Some(ch) = shared.character_snapshot() {
-                    dispatch_daily_scene_voice(&shared, &ch.id, "tired", None, 6000, false);
-                } else {
-                    shared.emit_bubble(default_line.to_string(), 6000);
+                    dispatch_daily_scene_voice(&shared, &ch.id, scene_key, None, 4800, false);
                 }
             }
 
@@ -1731,18 +2011,32 @@ fn spawn_telemetry_loop(shared: Shared) {
     std::thread::spawn(move || {
         // 错开启动首帧渲染窗口，避免冷启动瞬间争抢锁与 CPU
         std::thread::sleep(Duration::from_millis(800));
+        let mut ide_voice = companion::IdeVoiceTracker::new();
         loop {
             if shared.is_quitting() {
                 break;
             }
+            let now = now_ms();
             let outcome = match shared.inner.telemetry.lock() {
-                Ok(mut manager) => manager.tick(now_ms()),
+                Ok(mut manager) => manager.tick(now),
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(telemetry::TICK_INTERVAL_MS));
                     continue;
                 }
             };
             shared.update_telemetry_cache(&outcome.state);
+            if let Some(scene_key) = ide_voice.evaluate(&outcome.state, &outcome.scheduler_events, now) {
+                let cfg = shared.chat_ai_config();
+                if cfg.ide_voice_enabled
+                    && cfg.tts_enabled
+                    && !shared.snapshot().muted
+                    && !foreground::is_user_in_fullscreen_or_dnd()
+                {
+                    if let Some(ch) = shared.character_snapshot() {
+                        dispatch_daily_scene_voice(&shared, &ch.id, scene_key, None, 4800, false);
+                    }
+                }
+            }
             for event in outcome.scheduler_events {
                 shared.send(event);
             }
@@ -2321,6 +2615,7 @@ pub fn run() {
             spawn_schedule_loop(shared.clone());
             spawn_telemetry_loop(shared.clone());
             spawn_pomodoro_loop(shared.clone());
+            spawn_vram_idle_guard(shared.clone());
             hotkey::spawn(shared.clone(), handle.clone());
             http_hook::spawn_http_hook_server(shared.clone());
             // v1.3：启动后后台静默预热全部 8 位角色的元数据缓存，确保切角 <1ms 响应。

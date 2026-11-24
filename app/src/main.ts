@@ -93,6 +93,9 @@ async function bootMainStage(): Promise<void> {
     customVoice: "",
     charVoices: {},
     customPersonas: {},
+    ideVoiceEnabled: true,
+    companionVoiceMode: "balanced",
+    clickSfxEnabled: true,
   };
   let externalPanelOpen = false;
   let edgeDockState: EdgeDockState = {
@@ -110,6 +113,7 @@ async function bootMainStage(): Promise<void> {
   };
   let lastPlayAtMs = 0;
   let lastFeedFxAtMs = 0;
+  let switchingCharId: string | null = null;
 
   const root = document.getElementById("app");
   if (!root) {
@@ -284,6 +288,16 @@ async function bootMainStage(): Promise<void> {
     onSetAppearance: (appearance) => {
       setAppearance(appearance);
     },
+    onSetVramMode: (mode) => {
+      currentChatConfig = { ...currentChatConfig, vramMode: mode };
+      syncMenuState();
+      settingsSet("vramMode", mode).catch(() => {});
+    },
+    onSetBuiltinVoiceLang: (lang) => {
+      currentChatConfig = { ...currentChatConfig, builtinVoiceLang: lang };
+      syncMenuState();
+      settingsSet("builtinVoiceLang", lang).catch(() => {});
+    },
     onOpenChange: (open) => {
       setOverlayLock("contextMenu", open);
     },
@@ -328,6 +342,8 @@ async function bootMainStage(): Promise<void> {
         telemetryStatus: currentTelemetryStatus,
         aiConfigured: Boolean(currentChatConfig.apiKey?.trim()),
         ttsEnabled: currentChatConfig.ttsEnabled,
+        vramMode: currentChatConfig.vramMode ?? "balanced",
+        builtinVoiceLang: currentChatConfig.builtinVoiceLang ?? "ja",
       },
       visBounds,
     );
@@ -376,6 +392,8 @@ async function bootMainStage(): Promise<void> {
       telemetryStatus: currentTelemetryStatus,
       aiConfigured: Boolean(currentChatConfig.apiKey?.trim()),
       ttsEnabled: currentChatConfig.ttsEnabled,
+      vramMode: currentChatConfig.vramMode ?? "balanced",
+      builtinVoiceLang: currentChatConfig.builtinVoiceLang ?? "ja",
     });
   }
 
@@ -442,21 +460,33 @@ async function bootMainStage(): Promise<void> {
   }
 
   async function switchCharacter(charId: string): Promise<void> {
+    if (switchingCharId === charId) return;
+    switchingCharId = charId;
     const theme = applyCharTheme(charId);
     player.setAccentRgb(theme.accentRgb);
 
     const beforePlay = lastPlayAtMs;
-    const charState = await charSwitch(charId);
-    applyCharStateLocal(charState);
+    try {
+      const charState = await charSwitch(charId);
+      applyCharStateLocal(charState);
 
-    window.setTimeout(() => {
-      if (lastPlayAtMs === beforePlay && currentChar?.charId === charState.charId) {
-        const fallbackId = pickFallbackIdleClip(charState);
-        if (fallbackId) {
-          void triggerClipPlay(fallbackId);
+      window.setTimeout(() => {
+        if (
+          lastPlayAtMs === beforePlay &&
+          !player.hasActiveOrLoadingClip() &&
+          currentChar?.charId === charState.charId
+        ) {
+          const fallbackId = pickFallbackIdleClip(charState);
+          if (fallbackId) {
+            void triggerClipPlay(fallbackId);
+          }
         }
+      }, 450);
+    } finally {
+      if (switchingCharId === charId) {
+        switchingCharId = null;
       }
-    }, 60);
+    }
   }
 
   async function handleFeed(): Promise<void> {
@@ -560,8 +590,10 @@ async function bootMainStage(): Promise<void> {
     },
   });
 
-  stageCanvas.addEventListener("pointerenter", () => player.setEdgeHover(true));
-  stageCanvas.addEventListener("pointerleave", () => player.setEdgeHover(false));
+  if (!isTauri) {
+    stageCanvas.addEventListener("pointerenter", () => player.setEdgeHover(true));
+    stageCanvas.addEventListener("pointerleave", () => player.setEdgeHover(false));
+  }
 
   document.addEventListener("contextmenu", (e) => {
     const target = e.target as HTMLElement | null;
@@ -581,12 +613,12 @@ async function bootMainStage(): Promise<void> {
   let resolveAssetsRootReady: (() => void) | null = null;
   const assetsRootReady = new Promise<void>((resolve) => {
     resolveAssetsRootReady = resolve;
-    window.setTimeout(resolve, 250);
+    window.setTimeout(resolve, 2500);
   });
 
   await Promise.all([
     onPlay((payload) => {
-      if (currentChar && (!payload.charId || payload.charId === currentChar.charId)) {
+      if (!currentChar || !payload.charId || payload.charId === currentChar.charId) {
         lastPlayAtMs = performance.now();
       }
       void player.play(payload);
@@ -614,6 +646,9 @@ async function bootMainStage(): Promise<void> {
     listen<EdgeDockState>("pet_edge_dock", (event) => {
       applyEdgeDockState(event.payload);
     }).catch(() => {}),
+    listen<boolean>("pet_edge_hover", (event) => {
+      player.setEdgeHover(Boolean(event.payload));
+    }).catch(() => {}),
     listen<{ open: boolean; tab: PanelTabId }>("panel_state", (event) => {
       externalPanelOpen = Boolean(event.payload.open);
       island.setPanelOpen(externalPanelOpen);
@@ -640,6 +675,7 @@ async function bootMainStage(): Promise<void> {
     }).catch(() => {}),
     listen<ChatAiConfig>("pet_chat_config", (event) => {
       currentChatConfig = event.payload;
+      player.setClickSfxEnabled(event.payload.clickSfxEnabled !== false);
       previewPanel?.setChatConfig(event.payload);
       syncMenuState();
     }).catch(() => {}),
@@ -664,12 +700,14 @@ async function bootMainStage(): Promise<void> {
       if (event.payload) {
         setAssetsRoot(event.payload);
         resolveAssetsRootReady?.();
+        player.onAssetsRootReady();
       }
     }).catch(() => {}),
     listen<AssetsStatusPayload>("pet_assets_status", (event) => {
       if (event.payload?.assetsRoot) {
         setAssetsRoot(event.payload.assetsRoot);
         resolveAssetsRootReady?.();
+        player.onAssetsRootReady();
       }
     }).catch(() => {}),
     listen<Catalog>("pet_catalog_updated", (event) => {
@@ -733,6 +771,9 @@ async function bootMainStage(): Promise<void> {
     if (defaultCharId && (currentChar as CharState | null)?.charId !== defaultCharId) {
       await switchCharacter(defaultCharId).catch(() => null);
     }
+    window.setTimeout(() => {
+      player.ensureFirstFrameVisible();
+    }, 1800);
   }
 
   void currentCatalog;

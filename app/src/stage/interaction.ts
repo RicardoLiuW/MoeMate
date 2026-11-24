@@ -33,7 +33,7 @@ export class StageInteraction {
     this.canvas.addEventListener("pointercancel", this.onPointerCancel);
     this.canvas.addEventListener("lostpointercapture", this.onLostPointerCapture);
     this.canvas.addEventListener("contextmenu", this.onContextMenu);
-    window.addEventListener("pointerup", this.onGlobalPointerUp, true);
+    window.addEventListener("pointerup", this.onGlobalPointerUp, false);
     window.addEventListener("blur", this.onWindowBlur);
   }
 
@@ -141,7 +141,7 @@ export class StageInteraction {
       return;
     }
 
-    this.handlers.player.spawnClickRipple(e.clientX, e.clientY);
+    this.handlers.player.triggerClickFeedback(e.clientX, e.clientY);
     void petInteract("click", Math.round(e.clientX), Math.round(e.clientY))
       .then((nextState) => {
         this.handlers.onStateSync?.(nextState);
@@ -230,7 +230,7 @@ export class StageInteraction {
     this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
     this.canvas.removeEventListener("lostpointercapture", this.onLostPointerCapture);
     this.canvas.removeEventListener("contextmenu", this.onContextMenu);
-    window.removeEventListener("pointerup", this.onGlobalPointerUp, true);
+    window.removeEventListener("pointerup", this.onGlobalPointerUp, false);
     window.removeEventListener("blur", this.onWindowBlur);
   }
 }

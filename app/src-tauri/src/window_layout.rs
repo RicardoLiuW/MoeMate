@@ -23,8 +23,15 @@ pub const PANEL_LOGICAL_H: f64 = 450.0;
 
 const ISLAND_LOGICAL_W: f64 = 290.0;
 const EDGE_SNAP_THRESHOLD_CSS: f64 = 44.0;
-const TUCK_FRACTION: f64 = 0.44;
+pub const TUCK_FRACTION: f64 = 0.62;
 const UNDOCK_MARGIN_CSS: f64 = 18.0;
+pub const MIN_PEEK_VISIBLE_CSS: f64 = 44.0;
+/// 贴边暗中观察基础歪头角度（约 14°）
+pub const EDGE_PEEK_BASE_TILT_RAD: f64 = 14.0 * std::f64::consts::PI / 180.0;
+/// 贴边悬停探出时的额外倾斜角度（约 3.5°，合计约 17.5°）
+pub const EDGE_PEEK_HOVER_EXTRA_TILT_RAD: f64 = 3.5 * std::f64::consts::PI / 180.0;
+/// 贴边悬停探出时的水平探出比例（相对于 16:9 舞台宽度 draw_w）
+pub const EDGE_PEEK_HOVER_SLIDE_RATIO: f64 = 0.044;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkArea {
@@ -64,6 +71,22 @@ impl Default for BodyRatios {
 impl BodyRatios {
     pub fn width_u(self) -> f64 {
         (self.right_u - self.left_u).max(0.16)
+    }
+
+    pub fn height_v(self) -> f64 {
+        (self.bottom_v - self.top_v).max(0.20)
+    }
+
+    pub fn head_anchor_uv(self) -> (f64, f64) {
+        let head_u = (self.left_u + self.right_u) * 0.5;
+        let head_v = (self.top_v + self.height_v() * 0.18).clamp(0.06, 0.55);
+        (head_u, head_v)
+    }
+
+    pub fn peek_pivot_uv(self) -> (f64, f64) {
+        let pivot_u = (self.left_u + self.right_u) * 0.5;
+        let pivot_v = (self.top_v + self.height_v() * 0.52).clamp(0.25, 0.82);
+        (pivot_u, pivot_v)
     }
 }
 
@@ -317,8 +340,15 @@ pub fn compute_panel_position(
     let (island_left, island_right) =
         compute_island_screen_span(win_x, win_w, dpi, edge_side, work);
 
-    let avoid_left = char_rect.left.min(island_left);
-    let avoid_right = char_rect.right.max(island_right);
+    let (avoid_left, avoid_right) = if let Some(side) = edge_side {
+        let peek_rect = compute_edge_peek_visible_rect(side, win_x, win_y, win_w, win_h, work, ratios);
+        (
+            char_rect.left.min(peek_rect.left).min(island_left),
+            char_rect.right.max(peek_rect.right).max(island_right),
+        )
+    } else {
+        (char_rect.left.min(island_left), char_rect.right.max(island_right))
+    };
 
     let min_x = work.left + margin;
     let max_x = (work.right - panel_w - margin).max(min_x);
@@ -392,7 +422,41 @@ pub fn clamp_free_window_position(
     )
 }
 
-/// 计算某侧边缘吸附后的目标窗口位置（约 44% 角色躯干藏入边缘，56% 探头露出桌面）。
+/// 计算贴边深藏身时屏幕边缘对齐的归一化水平坐标 `u_edge`。
+pub fn compute_edge_tuck_u(
+    side: EdgeSide,
+    win_w: i32,
+    win_h: i32,
+    dpi: f64,
+    ratios: BodyRatios,
+) -> f64 {
+    let dpi = dpi.clamp(0.5, 4.0);
+    let (_, _, draw_w, _) = stage_geometry(win_w, win_h);
+    let body_w_u = ratios.width_u();
+    let (head_u, _) = ratios.head_anchor_uv();
+    let min_visible_u = ((MIN_PEEK_VISIBLE_CSS * dpi) / draw_w.max(1.0)).min(body_w_u * 0.55);
+
+    match side {
+        EdgeSide::Left => {
+            let raw = ratios.left_u + TUCK_FRACTION * body_w_u;
+            let clamped = raw.clamp(
+                (head_u + 0.025).min(ratios.right_u),
+                (head_u + 0.065).min(ratios.right_u),
+            );
+            clamped.min((ratios.right_u - min_visible_u).max(ratios.left_u))
+        }
+        EdgeSide::Right => {
+            let raw = ratios.right_u - TUCK_FRACTION * body_w_u;
+            let clamped = raw.clamp(
+                (head_u - 0.065).max(ratios.left_u),
+                (head_u - 0.025).max(ratios.left_u),
+            );
+            clamped.max((ratios.left_u + min_visible_u).min(ratios.right_u))
+        }
+    }
+}
+
+/// 计算某侧边缘吸附后的目标窗口位置（深藏身：约 62% 躯干藏入边缘，仅探出半边头肩暗中观察）。
 pub fn compute_edge_dock_target(
     side: EdgeSide,
     win_y: i32,
@@ -403,17 +467,70 @@ pub fn compute_edge_dock_target(
     ratios: BodyRatios,
 ) -> (i32, i32) {
     let (draw_x, _, draw_w, _) = stage_geometry(win_w, win_h);
-    let body_w_u = ratios.width_u();
+    let u_edge = compute_edge_tuck_u(side, win_w, win_h, dpi, ratios);
     let target_x = match side {
-        EdgeSide::Left => {
-            work.left - (draw_x + (ratios.left_u + TUCK_FRACTION * body_w_u) * draw_w).round() as i32
-        }
-        EdgeSide::Right => {
-            work.right - (draw_x + (ratios.right_u - TUCK_FRACTION * body_w_u) * draw_w).round() as i32
-        }
+        EdgeSide::Left => work.left - (draw_x + u_edge * draw_w).round() as i32,
+        EdgeSide::Right => work.right - (draw_x + u_edge * draw_w).round() as i32,
     };
     let target_y = clamp_vertical_position(win_y, win_h, dpi, work);
     (target_x, target_y)
+}
+
+/// 计算贴边歪头暗中观察时在屏幕工作区内的可见探头外接矩形。
+pub fn compute_edge_peek_visible_rect(
+    side: EdgeSide,
+    win_x: i32,
+    win_y: i32,
+    win_w: i32,
+    win_h: i32,
+    work: WorkArea,
+    ratios: BodyRatios,
+) -> ScreenRect {
+    let (draw_x, draw_y, draw_w, draw_h) = stage_geometry(win_w, win_h);
+    let (pivot_u, pivot_v) = ratios.peek_pivot_uv();
+    let pivot_x = win_x as f64 + draw_x + pivot_u * draw_w;
+    let pivot_y = win_y as f64 + draw_y + pivot_v * draw_h;
+
+    let dir = match side {
+        EdgeSide::Left => 1.0,
+        EdgeSide::Right => -1.0,
+    };
+    let theta = dir * EDGE_PEEK_BASE_TILT_RAD;
+    let cos_t = theta.cos();
+    let sin_t = theta.sin();
+
+    let corners = [
+        (win_x as f64 + draw_x + ratios.left_u * draw_w, win_y as f64 + draw_y + ratios.top_v * draw_h),
+        (win_x as f64 + draw_x + ratios.right_u * draw_w, win_y as f64 + draw_y + ratios.top_v * draw_h),
+        (win_x as f64 + draw_x + ratios.left_u * draw_w, win_y as f64 + draw_y + ratios.bottom_v * draw_h),
+        (win_x as f64 + draw_x + ratios.right_u * draw_w, win_y as f64 + draw_y + ratios.bottom_v * draw_h),
+    ];
+
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for (cx, cy) in corners {
+        let rx = cx - pivot_x;
+        let ry = cy - pivot_y;
+        let tx = pivot_x + rx * cos_t - ry * sin_t;
+        let ty = pivot_y + rx * sin_t + ry * cos_t;
+        min_x = min_x.min(tx);
+        max_x = max_x.max(tx);
+        min_y = min_y.min(ty);
+        max_y = max_y.max(ty);
+    }
+
+    let left = (min_x.floor() as i32).max(work.left).min(work.right - 1);
+    let right = (max_x.ceil() as i32).min(work.right).max(left + 1);
+    let top = (min_y.floor() as i32).max(work.top).min(work.bottom - 1);
+    let bottom = (max_y.ceil() as i32).min(work.bottom).max(top + 1);
+    ScreenRect {
+        left,
+        top,
+        right,
+        bottom,
+    }
 }
 
 /// 判断拖放松手时是否满足左右屏幕边缘吸附条件。
@@ -475,10 +592,13 @@ pub fn compute_undock_position(
     let effective_left = body_left_offset.min(island_left_offset);
     let effective_right = body_right_offset.max(island_right_offset);
 
-    let target_x = match side {
+    let raw_x = match side {
         EdgeSide::Left => work.left + margin - effective_left,
         EdgeSide::Right => work.right - margin - effective_right,
     };
+    let min_x = work.left + margin - body_left_offset;
+    let max_x = (work.right - margin - body_right_offset).max(min_x);
+    let target_x = raw_x.clamp(min_x, max_x);
     let target_y = clamp_vertical_position(win_y, win_h, dpi, work);
     (target_x, target_y)
 }
@@ -1065,5 +1185,88 @@ mod tests {
         let hidpi_ev = compute_edge_dock_event(true, Some(EdgeSide::Left), -450, 960, 1.5, work);
         assert!((hidpi_ev.visible_left_px - 300.0).abs() < 0.2);
         assert!((hidpi_ev.visible_right_px - 640.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn deep_tuck_respects_head_anchor_and_min_visible_across_scales_and_body_boxes() {
+        let work = std_work();
+        let boxes = [
+            BodyRatios::default(),
+            BodyRatios {
+                left_u: 0.18,
+                right_u: 0.82,
+                top_v: 0.08,
+                bottom_v: 0.94,
+            },
+            BodyRatios {
+                left_u: 0.36,
+                right_u: 0.64,
+                top_v: 0.10,
+                bottom_v: 0.88,
+            },
+        ];
+        let scales = [(448, 342, 1.0), (640, 450, 1.0), (960, 630, 1.0), (960, 675, 1.5)];
+
+        assert!(TUCK_FRACTION >= 0.58);
+        for ratios in boxes {
+            for (ww, wh, dpi) in scales {
+                for side in [EdgeSide::Left, EdgeSide::Right] {
+                    let (tx, ty) = compute_edge_dock_target(side, 300, ww, wh, dpi, work, ratios);
+                    let peek_rect = compute_edge_peek_visible_rect(side, tx, ty, ww, wh, work, ratios);
+                    assert!(peek_rect.left >= work.left && peek_rect.right <= work.right);
+                    assert!(peek_rect.top >= work.top && peek_rect.bottom <= work.bottom);
+                    let min_px = (MIN_PEEK_VISIBLE_CSS * dpi).round() as i32 - 2;
+                    assert!(
+                        peek_rect.right - peek_rect.left >= min_px.min(40),
+                        "peek rect too narrow: {:?} at ({ww}x{wh}, dpi={dpi})",
+                        peek_rect
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn panel_never_overlaps_deep_tucked_peek_rect() {
+        let work = std_work();
+        let ratios = BodyRatios::default();
+        let pw = PANEL_LOGICAL_W as i32;
+        let ph = PANEL_LOGICAL_H as i32;
+
+        for (ww, wh) in [(448, 342), (640, 450), (960, 630)] {
+            for side in [EdgeSide::Left, EdgeSide::Right] {
+                let (wx, wy) = compute_edge_dock_target(side, 260, ww, wh, 1.0, work, ratios);
+                let (px, py) = compute_panel_position(wx, wy, ww, wh, pw, ph, 1.0, Some(side), work, ratios);
+                let char_rect = compute_char_screen_rect(wx, wy, ww, wh, ratios);
+                let peek_rect = compute_edge_peek_visible_rect(side, wx, wy, ww, wh, work, ratios);
+                let (il, ir) = compute_island_screen_span(wx, ww, 1.0, Some(side), work);
+
+                assert!(!rects_overlap(px, py, px + pw, py + ph, char_rect.left, char_rect.top, char_rect.right, char_rect.bottom));
+                assert!(!rects_overlap(px, py, px + pw, py + ph, peek_rect.left, peek_rect.top, peek_rect.right, peek_rect.bottom));
+                assert!(!rects_overlap(px, py, px + pw, py + ph, il, wy, ir, wy + 86));
+            }
+        }
+    }
+
+    #[test]
+    fn undock_clamps_safely_on_narrow_screen_and_wide_body_box() {
+        let narrow_work = WorkArea {
+            left: 0,
+            top: 0,
+            right: 720,
+            bottom: 900,
+        };
+        let wide_ratios = BodyRatios {
+            left_u: 0.16,
+            right_u: 0.84,
+            top_v: 0.08,
+            bottom_v: 0.94,
+        };
+        for side in [EdgeSide::Left, EdgeSide::Right] {
+            let (ux, uy) = compute_undock_position(side, 300, 640, 450, 1.0, narrow_work, wide_ratios);
+            let char_rect = compute_char_screen_rect(ux, uy, 640, 450, wide_ratios);
+            assert!(char_rect.left >= narrow_work.left);
+            assert!(char_rect.right <= narrow_work.right);
+        }
     }
 }

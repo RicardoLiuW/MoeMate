@@ -1,4 +1,4 @@
-import type { TelemetryStatus } from "../shared/ipc";
+import type { BuiltinVoiceLang, TelemetryStatus, VramMode } from "../shared/ipc";
 import { createIcon, type IconName } from "./icons";
 import type { IslandMode, PanelTabId } from "./telemetryIsland";
 import type { UiAppearance } from "./themes";
@@ -18,6 +18,8 @@ export interface ContextMenuState {
   telemetryStatus: TelemetryStatus;
   aiConfigured?: boolean;
   ttsEnabled?: boolean;
+  vramMode?: VramMode;
+  builtinVoiceLang?: BuiltinVoiceLang;
 }
 
 export interface ContextMenuCallbacks {
@@ -33,6 +35,8 @@ export interface ContextMenuCallbacks {
   onSetIslandVisibility: (visible: boolean) => void;
   onSetIslandMode: (mode: IslandMode) => void;
   onSetAppearance: (appearance: UiAppearance) => void;
+  onSetVramMode?: (mode: VramMode) => void;
+  onSetBuiltinVoiceLang?: (lang: BuiltinVoiceLang) => void;
   onOpenChange: (open: boolean) => void;
 }
 
@@ -66,6 +70,8 @@ export class ContextMenu {
   private readonly autoStartPill: HTMLButtonElement;
   private readonly appearanceBtns = new Map<UiAppearance, HTMLButtonElement>();
   private readonly islandBtns = new Map<IslandStateChoice, HTMLButtonElement>();
+  private readonly vramBtns = new Map<VramMode, HTMLButtonElement>();
+  private readonly voiceLangBtns = new Map<BuiltinVoiceLang, HTMLButtonElement>();
 
   private readonly callbacks: ContextMenuCallbacks;
   private open = false;
@@ -256,6 +262,29 @@ export class ContextMenu {
         },
       ),
     );
+    this.el.appendChild(
+      this.makeSegmentRow(
+        "显存",
+        [
+          { key: "zero_vram" as VramMode, label: "零显存" },
+          { key: "balanced" as VramMode, label: "均衡" },
+          { key: "full_realtime" as VramMode, label: "满血" },
+        ],
+        this.vramBtns,
+        (key) => this.callbacks.onSetVramMode?.(key),
+      ),
+    );
+    this.el.appendChild(
+      this.makeSegmentRow(
+        "语种",
+        [
+          { key: "ja" as BuiltinVoiceLang, label: "日配" },
+          { key: "zh" as BuiltinVoiceLang, label: "中配" },
+        ],
+        this.voiceLangBtns,
+        (key) => this.callbacks.onSetBuiltinVoiceLang?.(key),
+      ),
+    );
 
     container.appendChild(this.el);
   }
@@ -374,6 +403,16 @@ export class ContextMenu {
     for (const [key, btn] of this.islandBtns.entries()) {
       btn.dataset.active = islandChoice === key ? "true" : "false";
     }
+
+    const activeVram: VramMode = state.vramMode ?? "balanced";
+    for (const [key, btn] of this.vramBtns.entries()) {
+      btn.dataset.active = activeVram === key ? "true" : "false";
+    }
+
+    const activeLang: BuiltinVoiceLang = state.builtinVoiceLang === "zh" ? "zh" : "ja";
+    for (const [key, btn] of this.voiceLangBtns.entries()) {
+      btn.dataset.active = activeLang === key ? "true" : "false";
+    }
   }
 
   public isOpen(): boolean {
@@ -396,7 +435,7 @@ export class ContextMenu {
     const visRight = visibleBounds?.right ?? vw;
     const availW = Math.max(180, visRight - visLeft - pad * 2);
     const menuW = Math.min(this.el.offsetWidth || 230, availW);
-    const menuH = Math.min(this.el.offsetHeight || 228, vh - pad * 2);
+    const menuH = Math.min(this.el.offsetHeight || 286, vh - pad * 2);
 
     const minX = visLeft + pad;
     const maxX = Math.max(minX, visRight - menuW - pad);

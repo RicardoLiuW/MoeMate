@@ -73,8 +73,7 @@ impl AgentActivityKind {
     pub fn is_held(self) -> bool {
         matches!(
             self,
-            Self::ProcessOffline
-                | Self::ServiceReconnecting
+            Self::ServiceReconnecting
                 | Self::PlanningMode
                 | Self::DeepReasoning
                 | Self::ResearchLookup
@@ -1340,5 +1339,11 @@ mod tests {
         assert!(!dup_events
             .iter()
             .any(|ev| matches!(ev, SchedulerEvent::AgentBubble { .. })));
+    }
+
+    #[test]
+    fn process_offline_is_not_held() {
+        assert!(!AgentActivityKind::ProcessOffline.is_held());
+        assert!(AgentActivityKind::CodeStreaming.is_held());
     }
 }

@@ -10,7 +10,7 @@ use std::fs;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -161,6 +161,17 @@ pub struct GptSovitsRuntime {
     pub last_gpt_weights: Mutex<Option<String>>,
     pub last_sovits_weights: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
+    pub last_used_ms: AtomicI64,
+}
+
+impl GptSovitsRuntime {
+    pub fn mark_used(&self, now_ms: i64) {
+        self.last_used_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    pub fn last_used(&self) -> i64 {
+        self.last_used_ms.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for GptSovitsRuntime {
@@ -172,6 +183,7 @@ impl Default for GptSovitsRuntime {
             last_gpt_weights: Mutex::new(None),
             last_sovits_weights: Mutex::new(None),
             last_error: Mutex::new(None),
+            last_used_ms: AtomicI64::new(0),
         }
     }
 }
@@ -1272,11 +1284,25 @@ fn prepare_compatible_ref_audio(
     Ok(src.to_string_lossy().to_string())
 }
 
+pub fn normalize_cache_text(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '~' | '～' | '!' | '！' | '。' | '.' | '…' | ',' | '，' | '♪' | '✨'
+            )
+        })
+        .trim()
+        .to_string()
+}
+
 pub fn build_cache_key(char_id: &str, text: &str, profile: &GptSovitsCharProfile) -> String {
+    let norm = normalize_cache_text(text);
     let ref_stamp = file_stamp(Path::new(profile.ref_audio_path.trim()));
     let speed = profile.speed_factor.clamp(0.8, 1.3);
     let raw = format!(
-        "v3|{char_id}|{text}|{}|{ref_stamp}|{}|{}|{}|{speed:.2}|{}|{}",
+        "v4|{char_id}|{norm}|{}|{ref_stamp}|{}|{}|{}|{speed:.2}|{}|{}",
         profile.ref_audio_path.trim(),
         profile.prompt_text.trim(),
         profile.prompt_lang.trim(),
@@ -1285,6 +1311,83 @@ pub fn build_cache_key(char_id: &str, text: &str, profile: &GptSovitsCharProfile
         profile.sovits_weights_path.trim()
     );
     md5_hex(raw.as_bytes())
+}
+
+fn build_legacy_cache_key_v3(char_id: &str, text: &str, profile: &GptSovitsCharProfile) -> String {
+    let ref_stamp = file_stamp(Path::new(profile.ref_audio_path.trim()));
+    let speed = profile.speed_factor.clamp(0.8, 1.3);
+    let raw = format!(
+        "v3|{char_id}|{}|{}|{ref_stamp}|{}|{}|{}|{speed:.2}|{}|{}",
+        text.trim(),
+        profile.ref_audio_path.trim(),
+        profile.prompt_text.trim(),
+        profile.prompt_lang.trim(),
+        profile.text_lang.trim(),
+        profile.gpt_weights_path.trim(),
+        profile.sovits_weights_path.trim()
+    );
+    md5_hex(raw.as_bytes())
+}
+
+pub fn lookup_cached_wav(
+    cache_dir: &Path,
+    cfg: &GptSovitsConfig,
+    char_id: &str,
+    text: &str,
+) -> Option<Vec<u8>> {
+    let clean = text.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let profile = cfg.char_profiles.get(char_id)?;
+    for key in [
+        build_cache_key(char_id, clean, profile),
+        build_legacy_cache_key_v3(char_id, clean, profile),
+    ] {
+        let p = cache_dir.join(format!("{key}.wav"));
+        if has_file_nonempty(&p) {
+            if let Ok(bytes) = fs::read(&p) {
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn prune_voice_cache_if_needed(cache_dir: &Path, max_files: usize, max_bytes: u64) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut items: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("wav") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            let len = meta.len();
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            total_bytes = total_bytes.saturating_add(len);
+            items.push((path, len, mtime));
+        }
+    }
+    if items.len() <= max_files && total_bytes <= max_bytes {
+        return;
+    }
+    items.sort_by_key(|(_, _, mtime)| *mtime);
+    let mut count = items.len();
+    for (path, len, _) in items {
+        if count <= max_files && total_bytes <= max_bytes {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            count = count.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(len);
+        }
+    }
 }
 
 fn contains_japanese_kana(s: &str) -> bool {
@@ -1349,15 +1452,11 @@ pub fn synthesize_gpt_sovits_wav(
     }
 
     let _ = fs::create_dir_all(cache_dir);
+    if let Some(cached) = lookup_cached_wav(cache_dir, cfg, char_id, clean) {
+        return Ok(cached);
+    }
     let cache_key = build_cache_key(char_id, clean, profile);
     let cache_file = cache_dir.join(format!("{cache_key}.wav"));
-    if has_file_nonempty(&cache_file) {
-        if let Ok(bytes) = fs::read(&cache_file) {
-            if !bytes.is_empty() {
-                return Ok(bytes);
-            }
-        }
-    }
 
     if !check_api_health(&cfg.api_url) {
         if cfg.auto_start_service {
@@ -1367,6 +1466,7 @@ pub fn synthesize_gpt_sovits_wav(
         }
     }
 
+    runtime.mark_used(crate::stats::now_ms());
     let _ = hot_swap_weights_if_needed(cfg, char_id, runtime);
 
     let install_dir = resolve_install_dir(base_root, &cfg.install_dir);
@@ -1412,6 +1512,8 @@ pub fn synthesize_gpt_sovits_wav(
             return Err(format!("本地推理接口返回 HTTP {status}"));
         }
         let _ = fs::write(&cache_file, &wav);
+        prune_voice_cache_if_needed(cache_dir, 300, 150 * 1024 * 1024);
+        runtime.mark_used(crate::stats::now_ms());
         Ok(wav)
     }
 
@@ -1645,5 +1747,11 @@ mod tests {
         assert_eq!(custom.host, "voice.local");
         assert_eq!(custom.port, 8443);
         assert_eq!(custom.base_path, "/v2");
+    }
+
+    #[test]
+    fn normalize_cache_text_strips_trailing_punctuation() {
+        assert_eq!(normalize_cache_text("你好呀～～！ "), "你好呀");
+        assert_eq!(normalize_cache_text("  早安   世界。  "), "早安 世界");
     }
 }

@@ -530,6 +530,32 @@ export interface GptSovitsProgressPayload {
   message: string;
 }
 
+export type BuiltinVoiceLang = "ja" | "zh";
+export type VramMode = "zero_vram" | "balanced" | "full_realtime";
+export type CompanionVoiceMode = "quiet" | "balanced" | "lively";
+
+export interface VramProcessInfo {
+  pid: number;
+  name: string;
+  usedMb: number;
+  source: "gpu" | "ollama" | "moemate" | string;
+}
+
+export interface VramStatusPayload {
+  available: boolean;
+  gpuName: string;
+  backend: string;
+  usedMb: number;
+  totalMb: number;
+  usedPct: number;
+  moemateGptSovitsRunning: boolean;
+  moemateGptSovitsPid: number | null;
+  moemateEstimatedMb: number;
+  processes: VramProcessInfo[];
+  advice: string;
+  updatedAtMs: number;
+}
+
 export interface ChatAiConfig {
   provider: string;
   baseUrl: string;
@@ -544,6 +570,12 @@ export interface ChatAiConfig {
   charVoices: Record<string, string>;
   customPersonas: Record<string, string>;
   gptSovits?: GptSovitsConfig;
+  builtinVoiceLang?: BuiltinVoiceLang;
+  vramMode?: VramMode;
+  vramAutoUnloadMinutes?: number;
+  ideVoiceEnabled?: boolean;
+  companionVoiceMode?: CompanionVoiceMode;
+  clickSfxEnabled?: boolean;
 }
 
 export interface ChatLogMessage {

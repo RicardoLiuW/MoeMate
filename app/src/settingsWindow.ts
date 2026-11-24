@@ -4,12 +4,16 @@ import {
   settingsSet,
   type AssetsProgressPayload,
   type AssetsStatusPayload,
+  type BuiltinVoiceLang,
   type CharState,
   type ChatAiConfig,
+  type CompanionVoiceMode,
   type GptSovitsCharProfile,
   type GptSovitsConfig,
   type GptSovitsProgressPayload,
   type GptSovitsStatusPayload,
+  type VramMode,
+  type VramStatusPayload,
 } from "./shared/ipc";
 import { createPixelAvatar } from "./ui/avatars";
 import { createIcon, type IconName } from "./ui/icons";
@@ -113,6 +117,12 @@ function createDefaultConfig(): ChatAiConfig {
     charVoices: {},
     customPersonas: {},
     gptSovits: createDefaultGptSovitsConfig(),
+    builtinVoiceLang: "ja",
+    vramMode: "balanced",
+    vramAutoUnloadMinutes: 5,
+    ideVoiceEnabled: true,
+    companionVoiceMode: "balanced",
+    clickSfxEnabled: true,
   };
 }
 
@@ -444,6 +454,148 @@ export async function bootSettingsWindow(): Promise<void> {
   voicePage.className = "sw-page";
   voicePage.hidden = true;
 
+  /* ----- 显存模式与实时占用诊断卡 ----- */
+  const vramCard = document.createElement("div");
+  vramCard.className = "sw-card";
+  const vramHead = document.createElement("div");
+  vramHead.className = "sw-card-head";
+  const vramTitle = document.createElement("span");
+  vramTitle.className = "sw-card-title";
+  vramTitle.textContent = "显存模式与实时占用诊断（12G 显存防冲突）";
+  const vramActions = document.createElement("div");
+  vramActions.className = "sw-head-actions";
+  const vramRefreshBtn = document.createElement("button");
+  vramRefreshBtn.type = "button";
+  vramRefreshBtn.className = "ip-mini-pill-btn";
+  vramRefreshBtn.textContent = "刷新显存";
+  vramRefreshBtn.addEventListener("click", () => {
+    void settingsSet("vramStatus", true).catch(() => {});
+  });
+  const vramReleaseBtn = document.createElement("button");
+  vramReleaseBtn.type = "button";
+  vramReleaseBtn.className = "ip-mini-pill-btn";
+  vramReleaseBtn.textContent = "释放语音显存";
+  vramReleaseBtn.addEventListener("click", () => {
+    void settingsSet("vramRelease", true).catch(() => {});
+  });
+  vramActions.append(vramRefreshBtn, vramReleaseBtn);
+  vramHead.append(vramTitle, vramActions);
+
+  const vramModeGrid = document.createElement("div");
+  vramModeGrid.className = "sw-vram-grid";
+  const vramModeBtns = new Map<VramMode, HTMLButtonElement>();
+  for (const vm of [
+    {
+      id: "zero_vram" as VramMode,
+      name: "零显存 / 生图优先",
+      desc: "0 MB 语音显存 · 纯离线语音包+缓存",
+    },
+    {
+      id: "balanced" as VramMode,
+      name: "均衡省显存（推荐）",
+      desc: "日常走离线包 · 空闲自动卸载",
+    },
+    {
+      id: "full_realtime" as VramMode,
+      name: "满血实时克隆",
+      desc: "常驻 GPT-SoVITS · 16G+ 显存推荐",
+    },
+  ]) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "sw-engine-card";
+    const nEl = document.createElement("span");
+    nEl.className = "sw-engine-name";
+    nEl.textContent = vm.name;
+    const dEl = document.createElement("span");
+    dEl.className = "sw-engine-desc";
+    dEl.textContent = vm.desc;
+    btn.append(nEl, dEl);
+    btn.addEventListener("click", () => {
+      config.vramMode = vm.id;
+      syncUi();
+      void settingsSet("vramMode", vm.id).catch(() => {});
+    });
+    vramModeGrid.appendChild(btn);
+    vramModeBtns.set(vm.id, btn);
+  }
+
+  const vramUnloadRow = document.createElement("div");
+  vramUnloadRow.className = "sw-lang-row";
+  const vramUnloadLbl = document.createElement("span");
+  vramUnloadLbl.className = "sw-field-label";
+  vramUnloadLbl.textContent = "均衡模式空闲自动卸载时间";
+  const vramUnloadStrip = document.createElement("div");
+  vramUnloadStrip.className = "ip-preset-strip";
+  const vramUnloadBtns = new Map<number, HTMLButtonElement>();
+  for (const mins of [3, 5, 10]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ip-preset-chip";
+    b.textContent = `${mins} 分钟`;
+    b.addEventListener("click", () => {
+      config.vramAutoUnloadMinutes = mins;
+      syncUi();
+    });
+    vramUnloadStrip.appendChild(b);
+    vramUnloadBtns.set(mins, b);
+  }
+  vramUnloadRow.append(vramUnloadLbl, vramUnloadStrip);
+
+  const vramMeterWrap = document.createElement("div");
+  vramMeterWrap.className = "sw-vram-meter";
+  const vramMeterMeta = document.createElement("div");
+  vramMeterMeta.className = "ip-row-between";
+  const vramGpuLabel = document.createElement("span");
+  vramGpuLabel.className = "sw-field-label";
+  vramGpuLabel.textContent = "GPU 显存检测中…";
+  const vramUsageText = document.createElement("span");
+  vramUsageText.className = "sw-hint";
+  vramUsageText.textContent = "—";
+  vramMeterMeta.append(vramGpuLabel, vramUsageText);
+
+  const vramBar = document.createElement("div");
+  vramBar.className = "sw-vram-bar";
+  const vramFill = document.createElement("div");
+  vramFill.className = "sw-vram-fill";
+  vramBar.appendChild(vramFill);
+
+  const vramProcsWrap = document.createElement("div");
+  vramProcsWrap.className = "sw-vram-procs";
+  const vramAdviceEl = document.createElement("div");
+  vramAdviceEl.className = "sw-vram-advice";
+  vramAdviceEl.textContent = "打开设置或点击「刷新显存」可查看当前显存占用进程。";
+
+  vramMeterWrap.append(vramMeterMeta, vramBar, vramProcsWrap, vramAdviceEl);
+  vramCard.append(vramHead, vramModeGrid, vramUnloadRow, vramMeterWrap);
+
+  function renderVramStatus(v: VramStatusPayload): void {
+    if (v.available && v.totalMb > 0) {
+      vramGpuLabel.textContent = `${v.gpuName} (${v.backend})`;
+      vramUsageText.textContent = `${(v.usedMb / 1024).toFixed(1)} / ${(v.totalMb / 1024).toFixed(1)} GB (${v.usedPct.toFixed(0)}%)`;
+      vramFill.style.width = `${Math.max(2, Math.min(100, v.usedPct)).toFixed(1)}%`;
+      vramFill.dataset.level = v.usedPct >= 85 ? "high" : v.usedPct >= 65 ? "mid" : "ok";
+    } else {
+      vramGpuLabel.textContent = v.gpuName || "未检测到独立显卡计数器";
+      vramUsageText.textContent = v.moemateGptSovitsRunning ? "GPT-SoVITS 运行中" : "MoeMate 0 MB";
+      vramFill.style.width = "0%";
+      vramFill.dataset.level = "ok";
+    }
+    vramReleaseBtn.disabled = !v.moemateGptSovitsRunning;
+
+    vramProcsWrap.replaceChildren();
+    if (v.processes.length > 0) {
+      for (const p of v.processes.slice(0, 6)) {
+        const tag = document.createElement("span");
+        tag.className = "sw-vram-proc-tag";
+        tag.dataset.source = p.source;
+        tag.textContent = `${p.name} · ${(p.usedMb / 1024).toFixed(1)}G`;
+        vramProcsWrap.appendChild(tag);
+      }
+    }
+    vramAdviceEl.textContent = v.advice;
+  }
+
   const engineCard = document.createElement("div");
   engineCard.className = "sw-card";
   const engineLbl = document.createElement("div");
@@ -530,14 +682,111 @@ export async function bootSettingsWindow(): Promise<void> {
   azureKeyRow.append(azureKeyInput, azureRegionInput);
   azureBox.appendChild(azureKeyRow);
 
+  const builtinLangRow = document.createElement("div");
+  builtinLangRow.className = "sw-lang-row";
+  const builtinLangLbl = document.createElement("span");
+  builtinLangLbl.className = "sw-field-label";
+  builtinLangLbl.textContent = "内置离线语音语种（0ms 秒播）";
+  const builtinLangStrip = document.createElement("div");
+  builtinLangStrip.className = "ip-preset-strip";
+  const builtinLangBtns = new Map<BuiltinVoiceLang, HTMLButtonElement>();
+  for (const item of [
+    { id: "ja" as BuiltinVoiceLang, label: "日语配音（默认）" },
+    { id: "zh" as BuiltinVoiceLang, label: "中文配音" },
+  ]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ip-preset-chip";
+    b.textContent = item.label;
+    b.addEventListener("click", () => {
+      config.builtinVoiceLang = item.id;
+      syncUi();
+      void settingsSet("builtinVoiceLang", item.id).catch(() => {});
+    });
+    builtinLangStrip.appendChild(b);
+    builtinLangBtns.set(item.id, b);
+  }
+  builtinLangRow.append(builtinLangLbl, builtinLangStrip);
+
   engineCard.append(
     engineLbl,
     ttsToggle.row,
     autoPlayToggle.row,
     mutedBanner,
     engineCardsWrap,
+    builtinLangRow,
     azureBox,
   );
+
+  /* ----- 智能防打扰与事件语音卡 ----- */
+  const companionCard = document.createElement("div");
+  companionCard.className = "sw-card";
+  const companionLbl = document.createElement("div");
+  companionLbl.className = "sw-card-title";
+  companionLbl.textContent = "智能防打扰与事件语音";
+
+  const ideVoiceToggle = createToggleSwitchRow(
+    "IDE 状态事件语音播报",
+    "Agent 开始工作、完成、等待确认、报错及上下文 ≥80% 时轻声提示",
+    () => {
+      const next = !(config.ideVoiceEnabled !== false);
+      config.ideVoiceEnabled = next;
+      syncUi();
+      void settingsSet("ideVoiceEnabled", next).catch(() => {});
+    },
+  );
+
+  const clickSfxToggle = createToggleSwitchRow(
+    "轻点击触感音效",
+    "轻戳角色时播放柔和五声音阶触感反馈（静音时自动关闭）",
+    () => {
+      const next = !(config.clickSfxEnabled !== false);
+      config.clickSfxEnabled = next;
+      syncUi();
+      void settingsSet("clickSfxEnabled", next).catch(() => {});
+    },
+  );
+
+  const companionModeRow = document.createElement("div");
+  companionModeRow.className = "sw-lang-row";
+  const companionModeLbl = document.createElement("span");
+  companionModeLbl.className = "sw-field-label";
+  companionModeLbl.textContent = "自主陪伴语音频率（防打扰）";
+  const companionModeStrip = document.createElement("div");
+  companionModeStrip.className = "ip-preset-strip";
+  const companionModeBtns = new Map<CompanionVoiceMode, HTMLButtonElement>();
+  for (const item of [
+    { id: "quiet" as CompanionVoiceMode, label: "安静" },
+    { id: "balanced" as CompanionVoiceMode, label: "适中（推荐）" },
+    { id: "lively" as CompanionVoiceMode, label: "活泼" },
+  ]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ip-preset-chip";
+    b.textContent = item.label;
+    b.addEventListener("click", () => {
+      config.companionVoiceMode = item.id;
+      syncUi();
+      void settingsSet("companionVoiceMode", item.id).catch(() => {});
+    });
+    companionModeStrip.appendChild(b);
+    companionModeBtns.set(item.id, b);
+  }
+  companionModeRow.append(companionModeLbl, companionModeStrip);
+
+  const companionHint = document.createElement("div");
+  companionHint.className = "sw-hint";
+  companionHint.textContent =
+    "全屏游戏/演示免打扰自动静默；高频打字 (<8s) 与 Agent 忙碌时自动避让顺延。";
+
+  companionCard.append(
+    companionLbl,
+    ideVoiceToggle.row,
+    clickSfxToggle.row,
+    companionModeRow,
+    companionHint,
+  );
+  voicePage.appendChild(companionCard);
 
   /* ----- GPT-SoVITS v2ProPlus 服务管理卡 ----- */
   const gptSovitsCard = document.createElement("div");
@@ -842,6 +1091,7 @@ export async function bootSettingsWindow(): Promise<void> {
       azureSpeechKey: azureKeyInput.value.trim(),
       azureSpeechRegion: azureRegionInput.value.trim() || "eastasia",
       gptSovits: previewGs,
+      builtinVoiceLang: config.builtinVoiceLang || "ja",
       text: previewLine,
     }).catch(() => {});
   }
@@ -1090,7 +1340,7 @@ export async function bootSettingsWindow(): Promise<void> {
 
   gsCharBox.append(refCol, promptCol, langGrid, previewTextCol, speedCol, advDetails);
   charVoiceCard.append(cvHead, voiceCharGrid, voiceSelect, gsCharBox);
-  voicePage.append(engineCard, gptSovitsCard, charVoiceCard);
+  voicePage.append(vramCard, engineCard, gptSovitsCard, charVoiceCard);
 
   /* ===== 页签 3：角色性格定制 ===== */
   const personaPage = document.createElement("div");
@@ -1547,6 +1797,15 @@ export async function bootSettingsWindow(): Promise<void> {
     }
     ttsToggle.setOn(config.ttsEnabled);
     autoPlayToggle.setOn(config.autoPlayVoice);
+    ideVoiceToggle.setOn(config.ideVoiceEnabled !== false);
+    clickSfxToggle.setOn(config.clickSfxEnabled !== false);
+    const activeCompanionMode: CompanionVoiceMode =
+      config.companionVoiceMode === "quiet" || config.companionVoiceMode === "lively"
+        ? config.companionVoiceMode
+        : "balanced";
+    for (const [id, btn] of companionModeBtns.entries()) {
+      btn.dataset.active = activeCompanionMode === id ? "true" : "false";
+    }
     autoStartToggle.setOn(autoStartEnabled);
     hotkeyToggle.setOn(globalHotkeyEnabled);
 
@@ -1556,6 +1815,23 @@ export async function bootSettingsWindow(): Promise<void> {
         : "azure";
     for (const [id, btn] of engineCardBtns.entries()) {
       btn.dataset.active = activeMode === id ? "true" : "false";
+    }
+
+    const activeVramMode: VramMode =
+      config.vramMode === "zero_vram" || config.vramMode === "full_realtime"
+        ? config.vramMode
+        : "balanced";
+    for (const [id, btn] of vramModeBtns.entries()) {
+      btn.dataset.active = activeVramMode === id ? "true" : "false";
+    }
+    vramUnloadRow.hidden = activeVramMode !== "balanced";
+    const curUnload = config.vramAutoUnloadMinutes ?? 5;
+    for (const [mins, btn] of vramUnloadBtns.entries()) {
+      btn.dataset.active = curUnload === mins ? "true" : "false";
+    }
+    const activeLang: BuiltinVoiceLang = config.builtinVoiceLang === "zh" ? "zh" : "ja";
+    for (const [id, btn] of builtinLangBtns.entries()) {
+      btn.dataset.active = activeLang === id ? "true" : "false";
     }
 
     const isGptSovits = activeMode === "gpt_sovits";
@@ -1722,6 +1998,9 @@ export async function bootSettingsWindow(): Promise<void> {
     }),
     listen<{ ok: boolean; message: string }>("pet_tts_status", (event) => {
       statusEl.textContent = event.payload.message;
+    }),
+    listen<VramStatusPayload>("pet_vram_status", (event) => {
+      renderVramStatus(event.payload);
     }),
     listen<GptSovitsStatusPayload>("pet_gpt_sovits_status", (event) => {
       gsStatus = event.payload;

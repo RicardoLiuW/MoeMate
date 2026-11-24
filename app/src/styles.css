@@ -2522,3 +2522,82 @@ html.is-settings-window .ui-layer {
     animation: none !important;
   }
 }
+
+/* ==========================================================================
+ * 显存模式与实时占用诊断看板 + 双语离线语音切换 (ZERO backdrop-filter)
+ * ========================================================================== */
+.sw-vram-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.sw-lang-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.sw-vram-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--card-soft, rgba(255, 255, 255, 0.55));
+}
+
+.sw-vram-bar {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(120, 105, 140, 0.16);
+  overflow: hidden;
+}
+
+.sw-vram-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  transition: width 220ms ease, background-color 220ms ease;
+  background: #57b894;
+}
+
+.sw-vram-fill[data-level="mid"] {
+  background: #e2a246;
+}
+
+.sw-vram-fill[data-level="high"] {
+  background: #dc6878;
+}
+
+.sw-vram-procs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.sw-vram-proc-tag {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card, #ffffff);
+  color: var(--ink-soft, #5a4b68);
+}
+
+.sw-vram-proc-tag[data-source="moemate"],
+.sw-vram-proc-tag[data-source="ollama"] {
+  border-color: var(--accent, #9679cf);
+  color: var(--accent-strong, #6b4ea8);
+  font-weight: 600;
+}
+
+.sw-vram-advice {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink-soft, #5a4b68);
+}

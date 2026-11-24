@@ -20,6 +20,9 @@ const SUSTAIN_FADE_LEAD_SEC = SUSTAIN_CROSSFADE_MS / 1000;
 const FRAME_HINT_INTERVAL_MS = 100;
 const BASE_VIDEO_WIDTH = 1280;
 const BASE_VIDEO_HEIGHT = 720;
+const EDGE_PEEK_BASE_TILT_RAD = (14.0 * Math.PI) / 180;
+const EDGE_PEEK_HOVER_EXTRA_TILT_RAD = (3.5 * Math.PI) / 180;
+const EDGE_PEEK_HOVER_SLIDE_RATIO = 0.044;
 
 /** 与 Rust scheduler.rs 严格同序，确保预热槽 100% 命中同一段拖拽动作 */
 const LIVELY_DRAG_FALLBACKS: readonly string[] = [
@@ -232,6 +235,10 @@ export class StagePlayer {
   private charId = "";
   private clipMap = new Map<string, ClipMeta>();
   private pendingPlay: PlayEvent | null = null;
+  private lastPlayPayload: PlayEvent | null = null;
+  private safeStartStuckSinceMs = 0;
+  private firstFrameWatchdogTimerId = 0;
+  private resumeRetryTimers: number[] = [];
   private muted = false;
   private draggingMode = false;
   private dragInstantActive = false;
@@ -264,7 +271,19 @@ export class StagePlayer {
   private overlayQuotaLow = false;
   private edgeDockSide: "left" | "right" | null = null;
   private edgeHovered = false;
-  private edgePeekOffsetPx = 0;
+  private edgePeekDir: -1 | 0 | 1 = 0;
+  private edgeDockBlend = 0;
+  private edgeHoverBlend = 0;
+  private currentEdgePeekAngleRad = 0;
+  private currentEdgePeekShiftX = 0;
+  private currentEdgePeekShiftY = 0;
+
+  private squashPos = 0;
+  private squashVel = 0;
+  private lastRenderMs = 0;
+  private clickSfxEnabled = true;
+  private sfxCtx: AudioContext | null = null;
+  private recentClickTimes: number[] = [];
 
   private cssWidth = 640;
   private cssHeight = 450;
@@ -315,9 +334,6 @@ export class StagePlayer {
       sustainPrepared: false,
     };
 
-    this.videoSink.append(v0, v1, vDrag);
-    document.body.appendChild(this.videoSink);
-
     this.syncCanvasSize();
     this.resizeObserver = new ResizeObserver(() => this.syncCanvasSize());
     this.resizeObserver.observe(this.canvas);
@@ -358,7 +374,11 @@ export class StagePlayer {
 
   public setEdgeDock(side: "left" | "right" | null): void {
     this.edgeDockSide = side;
-    if (!side) {
+    if (side === "left") {
+      this.edgePeekDir = 1;
+    } else if (side === "right") {
+      this.edgePeekDir = -1;
+    } else {
       this.edgeHovered = false;
     }
   }
@@ -380,9 +400,17 @@ export class StagePlayer {
    */
   public enterDragImmediately(): void {
     this.clearDragExitTimer();
+    this.clearResumeRetryTimers();
+    this.safeStartStuckSinceMs = 0;
     this.sustainPrepSeq += 1;
     this.sustainRelayInProgress = false;
     this.draggingMode = true;
+    this.edgeHovered = false;
+    this.edgeDockBlend = 0;
+    this.edgeHoverBlend = 0;
+    this.currentEdgePeekAngleRad = 0;
+    this.currentEdgePeekShiftX = 0;
+    this.currentEdgePeekShiftY = 0;
 
     if (
       this.dragPrewarmReady &&
@@ -420,6 +448,8 @@ export class StagePlayer {
     if (!dragging && this.dragInstantActive) {
       // 保留当前帧直到 Rust 的 dragEnd 切回 idle/work；160ms 后兜底自动恢复，绝不卡死在悬空态
       this.clearDragExitTimer();
+    this.clearResumeRetryTimers();
+    this.safeStartStuckSinceMs = 0;
       this.dragExitTimerId = window.setTimeout(() => {
         this.dragExitTimerId = 0;
         if (!this.draggingMode && this.dragInstantActive) {
@@ -430,6 +460,8 @@ export class StagePlayer {
     }
     if (dragging) {
       this.clearDragExitTimer();
+    this.clearResumeRetryTimers();
+    this.safeStartStuckSinceMs = 0;
     }
     if (this.activeIndex !== null) {
       const slot = this.slots[this.activeIndex];
@@ -442,6 +474,8 @@ export class StagePlayer {
   /** 右键或取消拖拽时立即退回原待机/工作槽并归位预热拖拽槽。 */
   public cancelDragImmediately(): void {
     this.clearDragExitTimer();
+    this.clearResumeRetryTimers();
+    this.safeStartStuckSinceMs = 0;
     this.draggingMode = false;
     const wasInstant = this.dragInstantActive;
     if (wasInstant) {
@@ -539,6 +573,10 @@ export class StagePlayer {
   public setCharacter(charState: CharState): void {
     const isSwitching = this.charId !== "" && this.charId !== charState.charId;
     this.stopVoice();
+    if (this.sfxCtx) {
+      void this.sfxCtx.close().catch(() => {});
+      this.sfxCtx = null;
+    }
     if (isSwitching) {
       this.playSeq += 1;
       this.sustainPrepSeq += 1;
@@ -565,6 +603,18 @@ export class StagePlayer {
       }
     }, 900);
 
+    if (this.firstFrameWatchdogTimerId !== 0) {
+      window.clearTimeout(this.firstFrameWatchdogTimerId);
+      this.firstFrameWatchdogTimerId = 0;
+    }
+    const watchCharId = charState.charId;
+    this.firstFrameWatchdogTimerId = window.setTimeout(() => {
+      this.firstFrameWatchdogTimerId = 0;
+      if (this.charId === watchCharId) {
+        this.ensureFirstFrameVisible();
+      }
+    }, 1200);
+
     const pending = this.pendingPlay;
     this.pendingPlay = null;
     if (
@@ -576,10 +626,70 @@ export class StagePlayer {
     }
   }
 
+  public hasActiveOrLoadingClip(): boolean {
+    return (
+      this.activeIndex !== null ||
+      this.pendingPlay !== null ||
+      this.slots.some((s) => s.clipId !== null)
+    );
+  }
+
+  public onAssetsRootReady(): void {
+    if (this.activeIndex === null && this.charId) {
+      const candidate = this.pendingPlay ?? this.lastPlayPayload;
+      if (candidate && (!candidate.charId || candidate.charId === this.charId)) {
+        void this.play(candidate);
+      }
+    }
+  }
+
+  public ensureFirstFrameVisible(): void {
+    if (this.activeIndex !== null) {
+      const activeSlot = this.slots[this.activeIndex];
+      if (activeSlot.video.paused && activeSlot.video.readyState >= 2) {
+        activeSlot.video.play().catch(() => {});
+      }
+      return;
+    }
+    if (!this.charId) return;
+    const candidate = this.pendingPlay ?? this.lastPlayPayload;
+    if (
+      candidate &&
+      (!candidate.charId || candidate.charId === this.charId) &&
+      this.clipMap.has(candidate.clipId)
+    ) {
+      void this.play(candidate);
+      return;
+    }
+    for (const clip of this.clipMap.values()) {
+      if (clip.qa?.status !== "fail") {
+        void this.play({
+          charId: this.charId,
+          clipId: clip.id,
+          startAtMs: clip.safeStartMs ?? 0,
+          mirror: false,
+          audio: clip.audio ?? null,
+        });
+        return;
+      }
+    }
+  }
+
+  private clearResumeRetryTimers(): void {
+    for (const id of this.resumeRetryTimers) {
+      window.clearTimeout(id);
+    }
+    this.resumeRetryTimers = [];
+  }
+
   public setMuted(muted: boolean): void {
     this.muted = muted;
     if (muted) {
       this.stopVoice();
+    if (this.sfxCtx) {
+      void this.sfxCtx.close().catch(() => {});
+      this.sfxCtx = null;
+    }
     }
     this.applyPlaybackSpeedToSlots();
   }
@@ -621,6 +731,68 @@ export class StagePlayer {
     }
     if (this.activeIndex === null) return null;
     return this.slots[this.activeIndex].meta;
+  }
+
+  public setClickSfxEnabled(enabled: boolean): void {
+    this.clickSfxEnabled = enabled;
+  }
+
+  public triggerClickFeedback(clientX: number, clientY: number): void {
+    this.spawnClickRipple(clientX, clientY);
+    this.squashPos = Math.min(this.squashPos + 0.055, 0.14);
+    this.squashVel = Math.min(this.squashVel + 1.45, 2.8);
+    if (!this.muted && this.clickSfxEnabled) {
+      this.playClickSfx();
+    }
+  }
+
+  private playClickSfx(): void {
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      if (!this.sfxCtx) {
+        this.sfxCtx = new AudioCtx();
+      }
+      const ctx = this.sfxCtx;
+      if (ctx.state === "suspended") {
+        void ctx.resume().catch(() => {});
+      }
+
+      const nowMs = performance.now();
+      this.recentClickTimes = this.recentClickTimes.filter((t) => nowMs - t <= 3000);
+      const comboIdx = Math.min(4, this.recentClickTimes.length);
+      this.recentClickTimes.push(nowMs);
+
+      const scaleHz = [523.25, 587.33, 659.25, 783.99, 880.0];
+      const baseHz = scaleHz[comboIdx];
+
+      const t0 = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(baseHz, t0);
+      osc.frequency.exponentialRampToValueAtTime(baseHz * 1.18, t0 + 0.045);
+
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.linearRampToValueAtTime(0.085, t0 + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.065);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.07);
+    } catch {
+      // ignore Web Audio errors
+    }
+  }
+
+  private isCurrentClipSleeping(): boolean {
+    const meta = this.getCurrentClipMeta();
+    if (!meta) return false;
+    if (meta.tags?.includes("sleep")) return true;
+    return /沉眠|打瞌睡|瞌睡|困倦|装睡/.test(meta.id);
   }
 
   public spawnClickRipple(clientX: number, clientY: number): void {
@@ -684,6 +856,10 @@ export class StagePlayer {
   public playVoice(payload: PetTtsPayload): void {
     if ((!payload.force && this.muted) || !payload.text.trim()) return;
     this.stopVoice();
+    if (this.sfxCtx) {
+      void this.sfxCtx.close().catch(() => {});
+      this.sfxCtx = null;
+    }
     const seq = this.voiceSeq;
 
     if (
@@ -761,8 +937,12 @@ export class StagePlayer {
       !this.clipMap.has(payload.clipId)
     ) {
       this.pendingPlay = payload;
+      if (!this.charId || !payload.charId || payload.charId === this.charId) {
+        this.lastPlayPayload = payload;
+      }
       return;
     }
+    this.lastPlayPayload = payload;
 
     // v1.5 零延迟拖拽去重：预热槽已抢先秒播同一段拖拽动作，直接无缝接管，不重载不卡顿
     if (
@@ -778,6 +958,8 @@ export class StagePlayer {
     }
 
     this.clearDragExitTimer();
+    this.clearResumeRetryTimers();
+    this.safeStartStuckSinceMs = 0;
 
     const seq = ++this.playSeq;
     this.sustainPrepSeq += 1;
@@ -866,6 +1048,23 @@ export class StagePlayer {
         }
         return;
       }
+      for (const delay of [180, 600, 1400]) {
+        const tid = window.setTimeout(() => {
+          if (!isStale() && video.paused) {
+            video.play().catch(() => {});
+          }
+        }, delay);
+        this.resumeRetryTimers.push(tid);
+      }
+      window.addEventListener(
+        "pointerdown",
+        () => {
+          if (!isStale() && video.paused) {
+            video.play().catch(() => {});
+          }
+        },
+        { once: true },
+      );
     }
 
     if (isStale()) {
@@ -907,6 +1106,37 @@ export class StagePlayer {
     this.emitFrameHint();
   }
 
+  private computeBodyRatios(meta: ClipMeta | null): {
+    leftU: number;
+    rightU: number;
+    topV: number;
+    bottomV: number;
+  } {
+    if (!meta || meta.bodyBox.length < 4) {
+      return { leftU: 0.30, rightU: 0.70, topV: 0.12, bottomV: 0.90 };
+    }
+    const baseW = meta.size?.[0] > 0 ? meta.size[0] : BASE_VIDEO_WIDTH;
+    const baseH = meta.size?.[1] > 0 ? meta.size[1] : BASE_VIDEO_HEIGHT;
+    const [bx, by, bw, bh] = meta.bodyBox;
+    if (!Number.isFinite(bx) || !Number.isFinite(by) || !Number.isFinite(bw) || !Number.isFinite(bh) || bw < 40 || bh < 40) {
+      return { leftU: 0.30, rightU: 0.70, topV: 0.12, bottomV: 0.90 };
+    }
+    const leftU = Math.max(0.15, Math.min(0.72, bx / baseW));
+    const rightU = Math.max(Math.min(leftU + 0.16, 0.85), Math.min(0.85, (bx + bw) / baseW));
+    const topV = Math.max(0.04, Math.min(0.65, by / baseH));
+    const bottomV = Math.max(Math.min(topV + 0.20, 0.98), Math.min(0.98, (by + bh) / baseH));
+    return { leftU, rightU, topV, bottomV };
+  }
+
+  private computePeekPivotUv(meta: ClipMeta | null, mirror: boolean): [number, number] {
+    const r = this.computeBodyRatios(meta);
+    const rawPivotU = (r.leftU + r.rightU) * 0.5;
+    const effPivotU = mirror ? 1 - rawPivotU : rawPivotU;
+    const heightV = Math.max(0.20, r.bottomV - r.topV);
+    const pivotV = Math.max(0.25, Math.min(0.82, r.topV + heightV * 0.52));
+    return [effPivotU, pivotV];
+  }
+
   public getBubbleAnchor(): BubbleAnchor {
     const stageW = this.cssWidth;
     const stageH = this.cssHeight;
@@ -922,27 +1152,49 @@ export class StagePlayer {
       : this.activeIndex !== null
         ? this.slots[this.activeIndex]
         : null;
-    const meta = slot?.meta;
+    const meta = slot?.meta ?? null;
+
+    let x: number;
+    let topY: number;
+    let headRightX: number;
     if (!meta || meta.bodyBox.length < 4) {
-      return {
-        x: stageW / 2,
-        topY: offsetY + Math.max(18, drawH * 0.14),
-        headRightX: stageW / 2 + drawW * 0.14,
-        videoTopY: offsetY,
-        stageWidth: stageW,
-        stageHeight: stageH,
-      };
+      x = stageW / 2;
+      topY = offsetY + Math.max(18, drawH * 0.14);
+      headRightX = stageW / 2 + drawW * 0.14;
+    } else {
+      const [bx, by, bw] = meta.bodyBox;
+      const rawCenterX = bx + bw / 2;
+      const centerX = slot?.mirror ? BASE_VIDEO_WIDTH - rawCenterX : rawCenterX;
+      const halfHeadW = Math.min(bw * 0.42, 165);
+      x = offsetX + centerX * scale;
+      topY = offsetY + by * scale;
+      headRightX = offsetX + (centerX + halfHeadW) * scale;
     }
 
-    const [bx, by, bw] = meta.bodyBox;
-    const rawCenterX = bx + bw / 2;
-    const centerX = slot?.mirror ? BASE_VIDEO_WIDTH - rawCenterX : rawCenterX;
-    const halfHeadW = Math.min(bw * 0.42, 165);
+    if (this.edgeDockBlend > 0.001 && Math.abs(this.currentEdgePeekAngleRad) > 0.0002) {
+      const [pu, pv] = this.computePeekPivotUv(meta, Boolean(slot?.mirror));
+      const pivotX = offsetX + pu * drawW;
+      const pivotY = offsetY + pv * drawH;
+      const cosT = Math.cos(this.currentEdgePeekAngleRad);
+      const sinT = Math.sin(this.currentEdgePeekAngleRad);
+
+      const rx1 = x - pivotX;
+      const ry1 = topY - pivotY;
+      const rotX = pivotX + this.currentEdgePeekShiftX + rx1 * cosT - ry1 * sinT;
+      const rotTopY = pivotY + this.currentEdgePeekShiftY + rx1 * sinT + ry1 * cosT;
+
+      const rx2 = headRightX - pivotX;
+      const rotHeadRightX = pivotX + this.currentEdgePeekShiftX + rx2 * cosT - ry1 * sinT;
+
+      x = rotX;
+      topY = rotTopY;
+      headRightX = rotHeadRightX;
+    }
 
     return {
-      x: offsetX + centerX * scale,
-      topY: offsetY + by * scale,
-      headRightX: offsetX + (centerX + halfHeadW) * scale,
+      x,
+      topY,
+      headRightX,
       videoTopY: offsetY,
       stageWidth: stageW,
       stageHeight: stageH,
@@ -1131,8 +1383,19 @@ export class StagePlayer {
           // ignore
         }
       }
+      const now = performance.now();
+      if (this.safeStartStuckSinceMs === 0) {
+        this.safeStartStuckSinceMs = now;
+      }
+      if (now - this.safeStartStuckSinceMs > 450) {
+        if (video.paused) {
+          video.play().catch(() => {});
+        }
+        return true;
+      }
       return false;
     }
+    this.safeStartStuckSinceMs = 0;
     return true;
   }
 
@@ -1143,6 +1406,9 @@ export class StagePlayer {
     drawY: number,
     drawW: number,
     drawH: number,
+    peekAngleRad = 0,
+    peekTx = 0,
+    peekTy = 0,
   ): void {
     const { video, mirror } = slot;
     if (video.readyState < 2 || alpha <= 0.001) return;
@@ -1151,6 +1417,30 @@ export class StagePlayer {
     const ctx = this.ctx;
     ctx.save();
     ctx.globalAlpha = alpha;
+    if (
+      Math.abs(peekAngleRad) > 0.0002 ||
+      Math.abs(peekTx) > 0.05 ||
+      Math.abs(peekTy) > 0.05
+    ) {
+      const [effPivotU, pivotV] = this.computePeekPivotUv(slot.meta, mirror);
+      const pivotX = drawX + effPivotU * drawW;
+      const pivotY = drawY + pivotV * drawH;
+      ctx.translate(pivotX + peekTx, pivotY + peekTy);
+      ctx.rotate(peekAngleRad);
+      ctx.translate(-pivotX, -pivotY);
+    }
+    if (Math.abs(this.squashPos) > 0.0004) {
+      const anchorX = slot.meta?.anchor?.[0] ?? 0.5;
+      const anchorY = slot.meta?.anchor?.[1] ?? 0.89;
+      const effAnchorX = mirror ? 1 - anchorX : anchorX;
+      const pivotX = drawX + effAnchorX * drawW;
+      const pivotY = drawY + anchorY * drawH;
+      const sx = 1 + this.squashPos * 0.68;
+      const sy = 1 - this.squashPos;
+      ctx.translate(pivotX, pivotY);
+      ctx.scale(sx, sy);
+      ctx.translate(-pivotX, -pivotY);
+    }
     if (mirror) {
       ctx.translate(drawX + drawW, drawY);
       ctx.scale(-1, 1);
@@ -1340,12 +1630,13 @@ export class StagePlayer {
   private maybeSpawnAmbientOverlayParticles(now: number): void {
     if (this.draggingMode) return;
     const act = this.overlayActivity;
+    const sleeping = this.isCurrentClipSleeping();
     let interval = 0;
     if (act === "code_streaming") {
       interval = Math.max(150, 560 - Math.min(380, this.overlayTps * 4.2));
     } else if (act === "code_diffing") {
       interval = 340;
-    } else if (act === "process_offline") {
+    } else if (sleeping) {
       interval = 1400;
     } else if (act === "knowledge_lookup" as string || act === "research_lookup") {
       interval = 650;
@@ -1382,7 +1673,7 @@ export class StagePlayer {
         startMs: now,
         durationMs: 880,
       });
-    } else if (act === "process_offline") {
+    } else if (sleeping) {
       this.overlayParticles.push({
         x: anchor.headRightX + 6,
         y: Math.max(102, safeY - 6),
@@ -1589,6 +1880,21 @@ export class StagePlayer {
   }
 
   private renderLoop = (now: number): void => {
+    const dt = this.lastRenderMs > 0 ? Math.min(0.05, (now - this.lastRenderMs) / 1000) : 0.016;
+    this.lastRenderMs = now;
+    if (Math.abs(this.squashPos) > 0.0004 || Math.abs(this.squashVel) > 0.0004) {
+      const subDt = dt * 0.5;
+      for (let s = 0; s < 2; s += 1) {
+        const accel = -320 * this.squashPos - 22 * this.squashVel;
+        this.squashVel += accel * subDt;
+        this.squashPos += this.squashVel * subDt;
+      }
+      if (Math.abs(this.squashPos) < 0.0004 && Math.abs(this.squashVel) < 0.0004) {
+        this.squashPos = 0;
+        this.squashVel = 0;
+      }
+    }
+
     this.maybeTickSustainLoop(now);
     const ctx = this.ctx;
     const cw = this.canvas.width;
@@ -1602,21 +1908,53 @@ export class StagePlayer {
     const drawX = (cw - drawW) / 2;
     const drawY = ch - drawH;
 
-    // 边缘吸附悬停探头微动效（10px 向桌面内侧轻探，纯视觉平滑过渡不移动 OS 窗口）
-    const peekTarget =
-      !this.draggingMode && this.edgeHovered && this.edgeDockSide === "left"
-        ? 10
-        : !this.draggingMode && this.edgeHovered && this.edgeDockSide === "right"
-          ? -10
-          : 0;
-    this.edgePeekOffsetPx += (peekTarget - this.edgePeekOffsetPx) * 0.22;
-    if (Math.abs(peekTarget - this.edgePeekOffsetPx) < 0.08) {
-      this.edgePeekOffsetPx = peekTarget;
+    // 贴边「暗中观察」：62% 深藏身 + 14° 歪头探望 + 悬停平滑探出 + 周期呼吸微动
+    const dockTarget = !this.draggingMode && this.edgeDockSide !== null ? 1 : 0;
+    const hoverTarget =
+      !this.draggingMode && this.edgeDockSide !== null && this.edgeHovered ? 1 : 0;
+    this.edgeDockBlend += (dockTarget - this.edgeDockBlend) * (1 - Math.exp(-dt * 10));
+    if (Math.abs(dockTarget - this.edgeDockBlend) < 0.001) {
+      this.edgeDockBlend = dockTarget;
+      if (dockTarget === 0) {
+        this.edgePeekDir = 0;
+      }
     }
-    const shiftedDrawX = drawX + this.edgePeekOffsetPx * this.dpr;
+    this.edgeHoverBlend += (hoverTarget - this.edgeHoverBlend) * (1 - Math.exp(-dt * 11));
+    if (Math.abs(hoverTarget - this.edgeHoverBlend) < 0.001) {
+      this.edgeHoverBlend = hoverTarget;
+    }
+
+    let peekAngleRad = 0;
+    let peekTx = 0;
+    let peekTy = 0;
+    if (this.edgeDockBlend > 0.001 && this.edgePeekDir !== 0) {
+      const breathWave = Math.sin(now * 0.0017);
+      const curiousPulse =
+        Math.pow(Math.max(0, Math.sin(now * 0.00048)), 4) * (1 - this.edgeHoverBlend);
+      const breathTiltRad =
+        breathWave * ((1.8 * Math.PI) / 180) +
+        this.edgePeekDir * curiousPulse * ((2.2 * Math.PI) / 180);
+      const breathShiftX =
+        Math.sin(now * 0.0017 - 0.5) * (0.0055 * drawW) +
+        this.edgePeekDir * curiousPulse * (0.014 * drawW);
+      const breathShiftY = Math.sin(now * 0.0034) * (0.0025 * drawH);
+
+      const baseTilt =
+        this.edgePeekDir *
+        (EDGE_PEEK_BASE_TILT_RAD + this.edgeHoverBlend * EDGE_PEEK_HOVER_EXTRA_TILT_RAD);
+      const hoverShiftX =
+        this.edgePeekDir * (this.edgeHoverBlend * EDGE_PEEK_HOVER_SLIDE_RATIO * drawW);
+
+      peekAngleRad = (baseTilt + breathTiltRad) * this.edgeDockBlend;
+      peekTx = (hoverShiftX + breathShiftX) * this.edgeDockBlend;
+      peekTy = breathShiftY * this.edgeDockBlend;
+    }
+    this.currentEdgePeekAngleRad = peekAngleRad;
+    this.currentEdgePeekShiftX = peekTx / this.dpr;
+    this.currentEdgePeekShiftY = peekTy / this.dpr;
 
     if (this.dragInstantActive) {
-      this.drawSlot(this.dragSlot, 1, shiftedDrawX, drawY, drawW, drawH);
+      this.drawSlot(this.dragSlot, 1, drawX, drawY, drawW, drawH, peekAngleRad, peekTx, peekTy);
     } else if (this.outgoingFromDrag && this.activeIndex !== null) {
       const t = Math.min(
         1,
@@ -1624,12 +1962,12 @@ export class StagePlayer {
       );
       const activeSlot = this.slots[this.activeIndex];
       if (t < 1) {
-        this.drawSlot(this.dragSlot, 1 - t, shiftedDrawX, drawY, drawW, drawH);
-        this.drawSlot(activeSlot, t, shiftedDrawX, drawY, drawW, drawH);
+        this.drawSlot(this.dragSlot, 1 - t, drawX, drawY, drawW, drawH, peekAngleRad, peekTx, peekTy);
+        this.drawSlot(activeSlot, t, drawX, drawY, drawW, drawH, peekAngleRad, peekTx, peekTy);
       } else {
         this.outgoingFromDrag = false;
         this.rearmDragSlot();
-        this.drawSlot(activeSlot, 1, shiftedDrawX, drawY, drawW, drawH);
+        this.drawSlot(activeSlot, 1, drawX, drawY, drawW, drawH, peekAngleRad, peekTx, peekTy);
       }
     } else if (this.outgoingIndex !== null && this.activeIndex !== null) {
       const t = Math.min(
@@ -1642,8 +1980,8 @@ export class StagePlayer {
       if (t < 1) {
         const outAlpha = this.sustainRelayInProgress ? Math.sqrt(1 - t) : 1 - t;
         const inAlpha = this.sustainRelayInProgress ? Math.sqrt(t) : t;
-        this.drawSlot(outgoingSlot, outAlpha, shiftedDrawX, drawY, drawW, drawH);
-        this.drawSlot(activeSlot, inAlpha, shiftedDrawX, drawY, drawW, drawH);
+        this.drawSlot(outgoingSlot, outAlpha, drawX, drawY, drawW, drawH, peekAngleRad, peekTx, peekTy);
+        this.drawSlot(activeSlot, inAlpha, drawX, drawY, drawW, drawH, peekAngleRad, peekTx, peekTy);
       } else {
         if (this.sustainRelayInProgress) {
           outgoingSlot.video.pause();
@@ -1653,10 +1991,10 @@ export class StagePlayer {
           releaseVideo(outgoingSlot);
         }
         this.outgoingIndex = null;
-        this.drawSlot(activeSlot, 1, shiftedDrawX, drawY, drawW, drawH);
+        this.drawSlot(activeSlot, 1, drawX, drawY, drawW, drawH, peekAngleRad, peekTx, peekTy);
       }
     } else if (this.activeIndex !== null) {
-      this.drawSlot(this.slots[this.activeIndex], 1, shiftedDrawX, drawY, drawW, drawH);
+      this.drawSlot(this.slots[this.activeIndex], 1, drawX, drawY, drawW, drawH, peekAngleRad, peekTx, peekTy);
     }
 
     this.renderTelemetryOverlay(now);
@@ -1667,6 +2005,13 @@ export class StagePlayer {
 
   public destroy(): void {
     this.clearDragExitTimer();
+    this.clearResumeRetryTimers();
+    if (this.firstFrameWatchdogTimerId !== 0) {
+      window.clearTimeout(this.firstFrameWatchdogTimerId);
+      this.firstFrameWatchdogTimerId = 0;
+    }
+    this.clearResumeRetryTimers();
+    this.safeStartStuckSinceMs = 0;
     if (this.dragPrewarmTimerId !== 0) {
       window.clearTimeout(this.dragPrewarmTimerId);
       this.dragPrewarmTimerId = 0;
@@ -1676,6 +2021,10 @@ export class StagePlayer {
     window.removeEventListener("resize", this.handleWindowResize);
     this.resizeObserver.disconnect();
     this.stopVoice();
+    if (this.sfxCtx) {
+      void this.sfxCtx.close().catch(() => {});
+      this.sfxCtx = null;
+    }
     releaseVideo(this.slots[0]);
     releaseVideo(this.slots[1]);
     releaseVideo(this.dragSlot);

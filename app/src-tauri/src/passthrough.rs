@@ -12,11 +12,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::{PhysicalPosition, WebviewWindow};
+use tauri::{Emitter, PhysicalPosition, WebviewWindow};
 
 use crate::mask::load_mask_bytes;
-use crate::state::{DragFastState, Shared};
+use crate::state::{DragFastState, EdgeSide, Shared};
 use crate::stats::now_ms;
+use crate::window_layout::{self, BodyRatios};
 
 const POLL_INTERVAL_IDLE_MS: u64 = 33;
 const POLL_INTERVAL_HOVER_MS: u64 = 16;
@@ -34,7 +35,8 @@ const WM_APP_DRAG_SYNC: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_AP
 enum HitOutcome {
     Outside,
     InsideTransparent,
-    Hit,
+    HitUi,
+    HitChar,
 }
 
 #[cfg(windows)]
@@ -89,6 +91,8 @@ pub fn spawn(shared: Shared, window: WebviewWindow) {
 
         let mut last_ignore: Option<bool> = None;
         let mut last_hit_ms = now_ms() - LEAVE_RESTORE_MS;
+        let mut last_char_hit_ms = now_ms() - LEAVE_RESTORE_MS;
+        let mut edge_hover_active = false;
         let mut last_drag_pos: Option<(i32, i32)> = None;
         let mut last_in_window = false;
         let mut logged_failures: HashSet<String> = HashSet::new();
@@ -142,12 +146,18 @@ pub fn spawn(shared: Shared, window: WebviewWindow) {
             }
 
             let locked = shared.passthrough_locked();
+            let mut hit_char = false;
             let hit = if locked {
                 last_in_window = false;
                 false
             } else {
-                match hit_test(&shared, &window, now, &mut logged_failures) {
-                    HitOutcome::Hit => {
+                match hit_test(&shared, &window, now, edge_hover_active, &mut logged_failures) {
+                    HitOutcome::HitChar => {
+                        last_in_window = true;
+                        hit_char = true;
+                        true
+                    }
+                    HitOutcome::HitUi => {
                         last_in_window = true;
                         true
                     }
@@ -163,6 +173,24 @@ pub fn spawn(shared: Shared, window: WebviewWindow) {
             };
             if hit {
                 last_hit_ms = now;
+            }
+            if hit_char {
+                last_char_hit_ms = now;
+            }
+
+            let next_edge_hover = if locked || shared.edge_side().is_none() {
+                false
+            } else if hit_char {
+                true
+            } else {
+                edge_hover_active && now - last_char_hit_ms < LEAVE_RESTORE_MS
+            };
+            if next_edge_hover != edge_hover_active {
+                edge_hover_active = next_edge_hover;
+                let _ = shared
+                    .inner
+                    .app
+                    .emit_to("main", "pet_edge_hover", edge_hover_active);
             }
 
             let want_ignore = if locked {
@@ -191,6 +219,7 @@ fn hit_test(
     shared: &Shared,
     window: &WebviewWindow,
     now: i64,
+    edge_hover_active: bool,
     logged_failures: &mut HashSet<String>,
 ) -> HitOutcome {
     let Ok(position) = window.outer_position() else {
@@ -217,17 +246,14 @@ fn hit_test(
     // v1.2：常驻 UI 热区（头顶/侧翼灵动岛）优先于 mask；用全窗原始 (u, v)，
     // 不随角色镜像翻转，保证灵动岛位置稳定可点。
     if shared.ui_hit_test(u, v) {
-        return HitOutcome::Hit;
+        return HitOutcome::HitUi;
     }
 
-    // v1.5：角色视频底对齐占满全窗宽度（16:9），顶部多出的透明头顶灵动岛空带直接穿透。
-    let Some((mask_u, mask_v)) = map_mask_uv(
-        local_x as f64,
-        local_y as f64,
-        size.width as f64,
-        size.height as f64,
-    ) else {
-        return HitOutcome::InsideTransparent;
+    let edge_side = shared.edge_side();
+    let ratios = if edge_side.is_some() {
+        Some(window_layout::character_body_ratios(shared))
+    } else {
+        None
     };
 
     let Some((current, frame)) = shared.frame_for_hint(now) else {
@@ -247,8 +273,33 @@ fn hit_test(
         load_mask_bytes(&path, current.frames)
     }) {
         Ok(mask) => {
-            if mask.hit_relaxed(frame, mask_u, mask_v, current.mirror, 1) {
-                HitOutcome::Hit
+            let hit = if let (Some(side), Some(ratios)) = (edge_side, ratios) {
+                edge_peek_mask_hit(
+                    &mask,
+                    frame,
+                    local_x as f64,
+                    local_y as f64,
+                    size.width as f64,
+                    size.height as f64,
+                    side,
+                    ratios,
+                    current.mirror,
+                    edge_hover_active,
+                )
+            } else {
+                // v1.5：角色视频底对齐占满全窗宽度（16:9），顶部多出的透明头顶灵动岛空带直接穿透。
+                let Some((mask_u, mask_v)) = map_mask_uv(
+                    local_x as f64,
+                    local_y as f64,
+                    size.width as f64,
+                    size.height as f64,
+                ) else {
+                    return HitOutcome::InsideTransparent;
+                };
+                mask.hit_relaxed(frame, mask_u, mask_v, current.mirror, 1)
+            };
+            if hit {
+                HitOutcome::HitChar
             } else {
                 HitOutcome::InsideTransparent
             }
@@ -260,6 +311,91 @@ fn hit_test(
             HitOutcome::InsideTransparent
         }
     }
+}
+
+/// 贴边歪头/悬停探出刚体逆变换：将窗口局部像素 `(local_x, local_y)` 还原为未倾斜/未平移的 16:9 舞台归一化 `(u, v)`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inverse_edge_peek_mask_uv(
+    local_x: f64,
+    local_y: f64,
+    win_w: f64,
+    win_h: f64,
+    side: EdgeSide,
+    ratios: BodyRatios,
+    mirror: bool,
+    hover_t: f64,
+) -> Option<(f64, f64)> {
+    if win_w <= 0.0 || win_h <= 0.0 {
+        return None;
+    }
+    let scale = (win_w / 1280.0).min(win_h / 720.0);
+    let draw_w = 1280.0 * scale;
+    let draw_h = 720.0 * scale;
+    if draw_w <= 0.0 || draw_h <= 0.0 {
+        return None;
+    }
+    let draw_x = (win_w - draw_w) * 0.5;
+    let draw_y = win_h - draw_h;
+
+    let (raw_pivot_u, pivot_v) = ratios.peek_pivot_uv();
+    let eff_pivot_u = if mirror { 1.0 - raw_pivot_u } else { raw_pivot_u };
+    let pivot_x = draw_x + eff_pivot_u * draw_w;
+    let pivot_y = draw_y + pivot_v * draw_h;
+
+    let dir = match side {
+        EdgeSide::Left => 1.0,
+        EdgeSide::Right => -1.0,
+    };
+    let t = hover_t.clamp(0.0, 1.0);
+    let theta =
+        dir * (window_layout::EDGE_PEEK_BASE_TILT_RAD + t * window_layout::EDGE_PEEK_HOVER_EXTRA_TILT_RAD);
+    let tx = dir * (t * window_layout::EDGE_PEEK_HOVER_SLIDE_RATIO * draw_w);
+
+    let rx = local_x - (pivot_x + tx);
+    let ry = local_y - pivot_y;
+    let cos_t = theta.cos();
+    let sin_t = theta.sin();
+    let orig_x = pivot_x + rx * cos_t + ry * sin_t;
+    let orig_y = pivot_y - rx * sin_t + ry * cos_t;
+
+    let u = (orig_x - draw_x) / draw_w;
+    let v = (orig_y - draw_y) / draw_h;
+    if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+        Some((u, v))
+    } else {
+        None
+    }
+}
+
+/// 贴边暗中观察状态下的掩码命中测试：兼容静息歪头、周期呼吸微动及悬停探出过渡态。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn edge_peek_mask_hit(
+    mask: &crate::mask::MaskData,
+    frame: u32,
+    local_x: f64,
+    local_y: f64,
+    win_w: f64,
+    win_h: f64,
+    side: EdgeSide,
+    ratios: BodyRatios,
+    mirror: bool,
+    edge_hover_active: bool,
+) -> bool {
+    let samples: &[f64] = if edge_hover_active {
+        &[1.0, 0.5, 0.0]
+    } else {
+        &[0.0, 0.35]
+    };
+    for &hover_t in samples {
+        if let Some((mu, mv)) =
+            inverse_edge_peek_mask_uv(local_x, local_y, win_w, win_h, side, ratios, mirror, hover_t)
+        {
+            if mask.hit_relaxed(frame, mu, mv, mirror, 2) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 将窗口内物理坐标映射到“底对齐 16:9 角色视频区”的归一化 `(u, v)`。
@@ -599,5 +735,116 @@ mod tests {
         let (u2, v2) = super::map_mask_uv(320.0, 90.0, 640.0, 450.0).unwrap();
         assert!((u2 - 0.5).abs() < 1e-6);
         assert!(v2.abs() < 1e-6);
+    }
+
+    #[test]
+    fn inverse_edge_peek_uv_inverts_forward_tilt_and_hover_slide() {
+        let ratios = crate::window_layout::BodyRatios::default();
+        let win_w = 640.0;
+        let win_h = 450.0;
+        let draw_w = 640.0;
+        let draw_h = 360.0;
+        let draw_y = 90.0;
+
+        for side in [crate::state::EdgeSide::Left, crate::state::EdgeSide::Right] {
+            for mirror in [false, true] {
+                for hover_t in [0.0, 0.5, 1.0] {
+                    let (raw_pu, pv) = ratios.peek_pivot_uv();
+                    let eff_pu = if mirror { 1.0 - raw_pu } else { raw_pu };
+                    let pivot_x = eff_pu * draw_w;
+                    let pivot_y = draw_y + pv * draw_h;
+
+                    let orig_u = 0.54;
+                    let orig_v = 0.24;
+                    let orig_x = orig_u * draw_w;
+                    let orig_y = draw_y + orig_v * draw_h;
+
+                    let dir = match side {
+                        crate::state::EdgeSide::Left => 1.0,
+                        crate::state::EdgeSide::Right => -1.0,
+                    };
+                    let theta = dir
+                        * (crate::window_layout::EDGE_PEEK_BASE_TILT_RAD
+                            + hover_t * crate::window_layout::EDGE_PEEK_HOVER_EXTRA_TILT_RAD);
+                    let tx = dir * (hover_t * crate::window_layout::EDGE_PEEK_HOVER_SLIDE_RATIO * draw_w);
+                    let rx = orig_x - pivot_x;
+                    let ry = orig_y - pivot_y;
+                    let fwd_x = pivot_x + tx + rx * theta.cos() - ry * theta.sin();
+                    let fwd_y = pivot_y + rx * theta.sin() + ry * theta.cos();
+
+                    let (inv_u, inv_v) = super::inverse_edge_peek_mask_uv(
+                        fwd_x, fwd_y, win_w, win_h, side, ratios, mirror, hover_t,
+                    )
+                    .expect("forward point must invert back into stage");
+                    assert!((inv_u - orig_u).abs() < 1e-6);
+                    assert!((inv_v - orig_v).abs() < 1e-6);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edge_peek_mask_hit_matches_tilted_head_and_passes_through_blank_area() {
+        use crate::mask::{bit_position, MaskData, FRAME_BYTES, MASK_H, MASK_W};
+
+        let mut bytes = vec![0u8; FRAME_BYTES];
+        // 在 (u=0.52, v=0.22) 附近点亮一块头部掩码
+        for y in 16..26 {
+            for x in 78..90 {
+                let (byte, bit) = bit_position(0, x, y);
+                bytes[byte] |= 1 << bit;
+            }
+        }
+        let mask = MaskData::from_bytes(bytes, 1).unwrap();
+        let ratios = crate::window_layout::BodyRatios::default();
+
+        // 计算 Left 贴边静息态 (hover_t = 0) 下头部中心 (0.52, 0.22) 旋转后的屏幕坐标
+        let (pu, pv) = ratios.peek_pivot_uv();
+        let pivot_x = pu * 640.0;
+        let pivot_y = 90.0 + pv * 360.0;
+        let theta = crate::window_layout::EDGE_PEEK_BASE_TILT_RAD;
+        let rx = 0.52 * 640.0 - pivot_x;
+        let ry = (90.0 + 0.22 * 360.0) - pivot_y;
+        let tilted_x = pivot_x + rx * theta.cos() - ry * theta.sin();
+        let tilted_y = pivot_y + rx * theta.sin() + ry * theta.cos();
+
+        assert!(super::edge_peek_mask_hit(
+            &mask,
+            0,
+            tilted_x,
+            tilted_y,
+            640.0,
+            450.0,
+            crate::state::EdgeSide::Left,
+            ratios,
+            false,
+            false
+        ));
+        // 左上角与右下角纯空白区域必须返回 false 保持穿透
+        assert!(!super::edge_peek_mask_hit(
+            &mask,
+            0,
+            20.0,
+            20.0,
+            640.0,
+            450.0,
+            crate::state::EdgeSide::Left,
+            ratios,
+            false,
+            false
+        ));
+        assert!(!super::edge_peek_mask_hit(
+            &mask,
+            0,
+            610.0,
+            420.0,
+            640.0,
+            450.0,
+            crate::state::EdgeSide::Left,
+            ratios,
+            false,
+            true
+        ));
+        let _ = (MASK_W, MASK_H);
     }
 }

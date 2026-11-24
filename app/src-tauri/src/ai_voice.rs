@@ -53,6 +53,24 @@ pub struct ChatAiConfig {
     /// 本地开源语音引擎（GPT-SoVITS v2ProPlus / 自定义 API）配置
     #[serde(default)]
     pub gpt_sovits: crate::gpt_sovits::GptSovitsConfig,
+    /// 内置离线语音包语种：`"ja" | "zh"`（默认 `"ja"`）
+    #[serde(default = "default_builtin_voice_lang")]
+    pub builtin_voice_lang: String,
+    /// 显存模式：`"zero_vram" | "balanced" | "full_realtime"`（默认 `"balanced"`）
+    #[serde(default = "default_vram_mode")]
+    pub vram_mode: String,
+    /// 均衡模式下空闲自动卸载 GPT-SoVITS 显存时间（分钟）
+    #[serde(default = "default_vram_auto_unload_minutes")]
+    pub vram_auto_unload_minutes: u32,
+    /// IDE 状态跃迁沿语音播报开关（默认开启）
+    #[serde(default = "default_true")]
+    pub ide_voice_enabled: bool,
+    /// 自主陪伴语音频率：`"quiet" | "balanced" | "lively"`（默认 `"balanced"`）
+    #[serde(default = "default_companion_voice_mode")]
+    pub companion_voice_mode: String,
+    /// 轻点击触感音效开关（默认开启）
+    #[serde(default = "default_true")]
+    pub click_sfx_enabled: bool,
 }
 
 fn default_provider() -> String {
@@ -79,6 +97,46 @@ fn default_azure_region() -> String {
     "eastasia".to_string()
 }
 
+fn default_builtin_voice_lang() -> String {
+    "ja".to_string()
+}
+
+fn default_vram_mode() -> String {
+    "balanced".to_string()
+}
+
+fn default_vram_auto_unload_minutes() -> u32 {
+    5
+}
+
+fn default_companion_voice_mode() -> String {
+    "balanced".to_string()
+}
+
+pub fn normalize_companion_voice_mode(mode: &str) -> &'static str {
+    match mode.trim() {
+        "quiet" => "quiet",
+        "lively" => "lively",
+        _ => "balanced",
+    }
+}
+
+pub fn normalize_builtin_voice_lang(lang: &str) -> &'static str {
+    if lang.trim().eq_ignore_ascii_case("zh") {
+        "zh"
+    } else {
+        "ja"
+    }
+}
+
+pub fn normalize_vram_mode(mode: &str) -> &'static str {
+    match mode.trim() {
+        "zero_vram" => "zero_vram",
+        "full_realtime" => "full_realtime",
+        _ => "balanced",
+    }
+}
+
 impl Default for ChatAiConfig {
     fn default() -> Self {
         Self {
@@ -95,6 +153,12 @@ impl Default for ChatAiConfig {
             char_voices: HashMap::new(),
             custom_personas: HashMap::new(),
             gpt_sovits: crate::gpt_sovits::GptSovitsConfig::default(),
+            builtin_voice_lang: default_builtin_voice_lang(),
+            vram_mode: default_vram_mode(),
+            vram_auto_unload_minutes: default_vram_auto_unload_minutes(),
+            ide_voice_enabled: true,
+            companion_voice_mode: default_companion_voice_mode(),
+            click_sfx_enabled: true,
         }
     }
 }
@@ -264,7 +328,7 @@ pub fn character_voice_profile(
             web_pitch: 1.08,
         },
         "qwen" => FemaleVoiceProfile {
-            azure_voice: "zh-CN-Mei:MAI-Voice-2.1-Flash",
+            azure_voice: "zh-CN-Xiaoxiao:DragonHDFlashLatestNeural",
             edge_voice: "zh-CN-XiaoxiaoNeural",
             edge_rate: "+4%",
             edge_pitch: "+2Hz",
@@ -411,8 +475,81 @@ pub fn detect_voice_scene(user_text: &str, binding: &str) -> Option<&'static str
         "sleep" => Some("sleep"),
         "wake" => Some("wake"),
         "work" => Some("work_start"),
+        "emo_happy" => Some("emo_happy"),
+        "emo_shy" => Some("emo_shy"),
+        "emo_sad" => Some("emo_sad"),
+        "emo_surprised" => Some("emo_surprised"),
+        "angry_1" => Some("angry_1"),
+        "angry_2" => Some("angry_2"),
+        "praise" => Some("praise"),
+        "tired" => Some("tired"),
+        "cheer" => Some("cheer"),
         _ => None,
     }
+}
+
+/// 按指定语种（`"ja" | "zh"`）从 `voices/<lang>/manifest.json` 读取场景台词与 `.ogg` 路径，
+/// 向下兼容旧版根目录 `voices/manifest.json` 并支持跨语种平滑回退。
+pub fn load_voice_manifest_scene_for_lang(
+    assets_root: &Path,
+    char_id: &str,
+    scene_key: &str,
+    lang: &str,
+) -> Option<(String, String)> {
+    let voices_root = assets_root.join("chars").join(char_id).join("voices");
+    let norm_lang = normalize_builtin_voice_lang(lang);
+    let order: [&str; 3] = if norm_lang == "zh" {
+        ["zh", "", "ja"]
+    } else {
+        ["ja", "zh", ""]
+    };
+
+    for sub in order {
+        let dir = if sub.is_empty() {
+            voices_root.clone()
+        } else {
+            voices_root.join(sub)
+        };
+        let manifest_path = dir.join("manifest.json");
+        let Ok(raw) = fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(scene) = val.get("scenes").and_then(|s| s.get(scene_key)) else {
+            continue;
+        };
+        let Some(file) = scene.get("file").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        let text = scene
+            .get("zhText")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| scene.get("text").and_then(Value::as_str).map(str::trim))
+            .unwrap_or("");
+        if file.is_empty()
+            || text.is_empty()
+            || file.contains("..")
+            || file.contains('/')
+            || file.contains('\\')
+        {
+            continue;
+        }
+        let full_audio = dir.join(file);
+        if !full_audio.is_file() {
+            continue;
+        }
+        let rel = if sub.is_empty() {
+            format!("chars/{char_id}/voices/{file}")
+        } else {
+            format!("chars/{char_id}/voices/{sub}/{file}")
+        };
+        return Some((text.to_string(), rel));
+    }
+    None
 }
 
 /// 从 `assets/chars/<char_id>/voices/manifest.json` 读取指定场景的专属台词与 `.ogg` 路径。
@@ -421,34 +558,18 @@ pub fn load_voice_manifest_scene(
     char_id: &str,
     scene_key: &str,
 ) -> Option<(String, String)> {
-    let manifest_path = assets_root
-        .join("chars")
-        .join(char_id)
-        .join("voices")
-        .join("manifest.json");
-    let raw = fs::read_to_string(manifest_path).ok()?;
-    let val: Value = serde_json::from_str(&raw).ok()?;
-    let scene = val.get("scenes")?.get(scene_key)?;
-    let file = scene.get("file")?.as_str()?.trim();
-    let text = scene.get("text")?.as_str()?.trim();
-    if file.is_empty() || text.is_empty() || file.contains("..") || file.contains('/') || file.contains('\\') {
-        return None;
-    }
-    let full_audio = assets_root.join("chars").join(char_id).join("voices").join(file);
-    if !full_audio.is_file() {
-        return None;
-    }
-    Some((text.to_string(), format!("chars/{char_id}/voices/{file}")))
+    load_voice_manifest_scene_for_lang(assets_root, char_id, scene_key, "ja")
 }
 
 /// 直接读取本地语音包 `.ogg` 字节并编码为 `ogg_base64` 载荷，彻底规避 WebView2 `asset://` 协议/MIME 差异。
-pub fn load_voice_manifest_ogg_payload(
+pub fn load_voice_manifest_ogg_payload_for_lang(
     assets_root: &Path,
     char_id: &str,
     scene_key: &str,
+    lang: &str,
     force: bool,
 ) -> Option<(String, PetTtsPayload)> {
-    let (line, rel) = load_voice_manifest_scene(assets_root, char_id, scene_key)?;
+    let (line, rel) = load_voice_manifest_scene_for_lang(assets_root, char_id, scene_key, lang)?;
     let full_path = assets_root.join(&rel);
     let bytes = fs::read(full_path).ok()?;
     if bytes.is_empty() {
@@ -468,17 +589,28 @@ pub fn load_voice_manifest_ogg_payload(
     ))
 }
 
+#[allow(dead_code)]
+pub fn load_voice_manifest_ogg_payload(
+    assets_root: &Path,
+    char_id: &str,
+    scene_key: &str,
+    force: bool,
+) -> Option<(String, PetTtsPayload)> {
+    load_voice_manifest_ogg_payload_for_lang(assets_root, char_id, scene_key, "ja", force)
+}
+
 /// 试听本地情绪语音包：轮播 6 句代表台词并返回 `(台词文本, ogg_base64 载荷)`。
-pub fn load_preview_local_voice(
+pub fn load_preview_local_voice_for_lang(
     assets_root: &Path,
     char_id: &str,
     seq: u64,
+    lang: &str,
 ) -> Option<(String, PetTtsPayload)> {
     const PREVIEW_SCENES: &[&str] = &["greet", "click_1", "praise", "feed", "cheer", "click_2"];
     let start = (seq as usize) % PREVIEW_SCENES.len();
     for offset in 0..PREVIEW_SCENES.len() {
         let key = PREVIEW_SCENES[(start + offset) % PREVIEW_SCENES.len()];
-        if let Some(hit) = load_voice_manifest_ogg_payload(assets_root, char_id, key, true) {
+        if let Some(hit) = load_voice_manifest_ogg_payload_for_lang(assets_root, char_id, key, lang, true) {
             return Some(hit);
         }
     }
@@ -486,15 +618,16 @@ pub fn load_preview_local_voice(
 }
 
 /// 兼容检查 `assets/chars/<char_id>/voices/` 下的散装音频文件。
-pub fn resolve_local_voice_pack(
+pub fn resolve_local_voice_pack_for_lang(
     assets_root: &Path,
     char_id: &str,
     user_text: &str,
     reply_text: &str,
     binding: &str,
+    lang: &str,
 ) -> Option<String> {
     if let Some(scene_key) = detect_voice_scene(user_text, binding) {
-        if let Some((_, rel)) = load_voice_manifest_scene(assets_root, char_id, scene_key) {
+        if let Some((_, rel)) = load_voice_manifest_scene_for_lang(assets_root, char_id, scene_key, lang) {
             return Some(rel);
         }
     }
@@ -1440,8 +1573,63 @@ pub fn default_ja_voice_for_char(char_id: &str) -> &'static str {
     }
 }
 
-/// 8 角色 × 19 日常场景地道日语声优台词库（仅含日文假名与日文汉字）。
+/// 8 角色 × 32 场景中/日双语内置台词表（编译期嵌入 `tools/voice_scripts.json`）。
+fn builtin_voice_scripts() -> &'static HashMap<String, HashMap<String, (String, String)>> {
+    static SCRIPTS: OnceLock<HashMap<String, HashMap<String, (String, String)>>> = OnceLock::new();
+    SCRIPTS.get_or_init(|| {
+        let mut out = HashMap::new();
+        let raw = include_str!("../../../tools/voice_scripts.json");
+        let Ok(val) = serde_json::from_str::<Value>(raw) else {
+            return out;
+        };
+        let Some(chars) = val.get("characters").and_then(Value::as_object) else {
+            return out;
+        };
+        for (cid, cfg) in chars {
+            let mut scene_map = HashMap::new();
+            if let Some(scenes) = cfg.get("scenes").and_then(Value::as_object) {
+                for (skey, item) in scenes {
+                    let zh = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
+                    let ja = item
+                        .get("ja")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
+                    if !zh.is_empty() || !ja.is_empty() {
+                        scene_map.insert(skey.clone(), (zh, ja));
+                    }
+                }
+            }
+            out.insert(cid.clone(), scene_map);
+        }
+        out
+    })
+}
+
+pub fn builtin_zh_voice_for_scene(char_id: &str, scene_key: &str) -> Option<&'static str> {
+    builtin_voice_scripts()
+        .get(char_id)
+        .and_then(|m| m.get(scene_key))
+        .map(|(zh, _)| zh.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// 8 角色 × 32 日常/情绪/IDE/陪伴场景地道日语声优台词库（仅含日文假名与日文汉字）。
 pub fn builtin_ja_voice_for_scene(char_id: &str, scene_key: &str) -> Option<&'static str> {
+    if let Some(ja) = builtin_voice_scripts()
+        .get(char_id)
+        .and_then(|m| m.get(scene_key))
+        .map(|(_, ja)| ja.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(ja);
+    }
     match (char_id, scene_key) {
         // claude
         ("claude", "click_1") => Some("こほんっ…これくらいのスキンシップなら安全基準内です。次はありませんからね。"),
@@ -1822,10 +2010,17 @@ pub fn build_tts_payload(
     gpt_runtime: &crate::gpt_sovits::GptSovitsRuntime,
 ) -> Result<(PetTtsPayload, Option<String>), String> {
     let profile = character_voice_profile(char_id, &cfg.char_voices, &cfg.custom_voice);
+    let vram_mode = normalize_vram_mode(&cfg.vram_mode);
 
     let try_local_pack = || -> Option<PetTtsPayload> {
-        let rel_path =
-            resolve_local_voice_pack(assets_root, char_id, user_text, reply_text, binding)?;
+        let rel_path = resolve_local_voice_pack_for_lang(
+            assets_root,
+            char_id,
+            user_text,
+            reply_text,
+            binding,
+            &cfg.builtin_voice_lang,
+        )?;
         let full_path = assets_root.join(&rel_path);
         if let Ok(bytes) = fs::read(&full_path) {
             if !bytes.is_empty() {
@@ -1851,8 +2046,56 @@ pub fn build_tts_payload(
         })
     };
 
+    if vram_mode == "zero_vram" {
+        let (clean_reply, _) = extract_action_tag(reply_text);
+        if let Some(cached_wav) =
+            crate::gpt_sovits::lookup_cached_wav(cache_dir, &cfg.gpt_sovits, char_id, &clean_reply)
+        {
+            return Ok((
+                PetTtsPayload {
+                    char_id: char_id.to_string(),
+                    text: clean_reply,
+                    kind: "wav_base64".to_string(),
+                    data: base64_encode(&cached_wav),
+                    rate: 1.0,
+                    pitch: 1.0,
+                    force: false,
+                },
+                None,
+            ));
+        }
+        if let Some(local) = try_local_pack() {
+            return Ok((local, None));
+        }
+        if cfg.tts_mode == "azure" && !cfg.azure_speech_key.trim().is_empty() {
+            let style = azure_style_for_action(profile.azure_voice, binding);
+            let ogg = synthesize_azure_tts_ogg(
+                &cfg.azure_speech_region,
+                &cfg.azure_speech_key,
+                reply_text,
+                profile.azure_voice,
+                style,
+                profile.edge_rate,
+                profile.edge_pitch,
+            )?;
+            return Ok((
+                PetTtsPayload {
+                    char_id: char_id.to_string(),
+                    text: reply_text.to_string(),
+                    kind: "ogg_base64".to_string(),
+                    data: base64_encode(&ogg),
+                    rate: profile.web_rate,
+                    pitch: profile.web_pitch,
+                    force: false,
+                },
+                None,
+            ));
+        }
+        return Err("当前为「零显存 / 生图优先」模式，未命中本地语音缓存".to_string());
+    }
+
     if cfg.tts_mode == "gpt_sovits" {
-        if !prefer_dynamic && !cfg.gpt_sovits.daily_dynamic_voice {
+        if !prefer_dynamic && (vram_mode == "balanced" || !cfg.gpt_sovits.daily_dynamic_voice) {
             if let Some(local) = try_local_pack() {
                 return Ok((local, None));
             }
@@ -1982,7 +2225,8 @@ pub fn build_preview_tts_payload(
     fallback_text: &str,
     gpt_runtime: &crate::gpt_sovits::GptSovitsRuntime,
 ) -> Result<(Option<String>, PetTtsPayload, String), String> {
-    if cfg.tts_mode == "gpt_sovits" {
+    let vram_mode = normalize_vram_mode(&cfg.vram_mode);
+    if vram_mode != "zero_vram" && cfg.tts_mode == "gpt_sovits" {
         let (clean_preview, _) = extract_action_tag(fallback_text);
         let voice_script = resolve_voice_script_for_gpt_sovits(cfg, char_id, &clean_preview);
         let wav = crate::gpt_sovits::synthesize_gpt_sovits_wav(
@@ -2008,13 +2252,19 @@ pub fn build_preview_tts_payload(
         ));
     }
 
-    if cfg.tts_mode == "local" || cfg.azure_speech_key.trim().is_empty() {
-        let (line, payload) = load_preview_local_voice(assets_root, char_id, seq)
-            .ok_or_else(|| "未找到该角色的本地语音包".to_string())?;
+    if cfg.tts_mode == "local" || vram_mode == "zero_vram" || cfg.azure_speech_key.trim().is_empty() {
+        let (line, payload) =
+            load_preview_local_voice_for_lang(assets_root, char_id, seq, &cfg.builtin_voice_lang)
+                .ok_or_else(|| "未找到该角色的本地语音包".to_string())?;
+        let lang_label = if normalize_builtin_voice_lang(&cfg.builtin_voice_lang) == "zh" {
+            "正在播放内置中文离线语音包"
+        } else {
+            "正在播放内置日语离线语音包"
+        };
         return Ok((
             Some(line),
             payload,
-            "正在播放本地情绪语音包".to_string(),
+            lang_label.to_string(),
         ));
     }
 
@@ -2059,12 +2309,32 @@ pub fn build_scene_tts_payload(
     force: bool,
     gpt_runtime: &crate::gpt_sovits::GptSovitsRuntime,
 ) -> Option<PetTtsPayload> {
-    let manifest_key = if scene_key == "pomodoro_done" {
-        "done"
-    } else {
-        scene_key
+    let fallback_key = match scene_key {
+        "pomodoro_done" | "done_2" => Some("done"),
+        "work_start_2" => Some("work_start"),
+        _ => None,
     };
-    if cfg.tts_mode == "gpt_sovits" && cfg.gpt_sovits.daily_dynamic_voice {
+    let vram_mode = normalize_vram_mode(&cfg.vram_mode);
+
+    let try_manifest = |key: &str| {
+        load_voice_manifest_ogg_payload_for_lang(
+            assets_root,
+            char_id,
+            key,
+            &cfg.builtin_voice_lang,
+            force,
+        )
+        .map(|(_, p)| p)
+    };
+
+    // 均衡或零显存模式下：日常/作息/IDE 场景优先走 0ms 离线双语语音包（0 显存占用）
+    if vram_mode != "full_realtime" {
+        if let Some(p) = try_manifest(scene_key).or_else(|| fallback_key.and_then(try_manifest)) {
+            return Some(p);
+        }
+    }
+
+    if vram_mode != "zero_vram" && cfg.tts_mode == "gpt_sovits" && cfg.gpt_sovits.daily_dynamic_voice {
         let want_ja = cfg
             .gpt_sovits
             .char_profiles
@@ -2097,7 +2367,227 @@ pub fn build_scene_tts_payload(
             });
         }
     }
-    load_voice_manifest_ogg_payload(assets_root, char_id, manifest_key, force).map(|(_, p)| p)
+    try_manifest(scene_key).or_else(|| fallback_key.and_then(try_manifest))
+}
+
+/* ------------------------------------------------------------------ */
+/* 10 桶细粒度回复情绪抓取引擎                                          */
+/* ------------------------------------------------------------------ */
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EmotionBucket {
+    Happy,
+    Shy,
+    Proud,
+    Angry,
+    Sad,
+    Surprised,
+    Sleepy,
+    Thinking,
+    Cheer,
+    Affection,
+}
+
+impl EmotionBucket {
+    pub fn voice_scene_key(self) -> &'static str {
+        match self {
+            Self::Happy => "emo_happy",
+            Self::Shy => "emo_shy",
+            Self::Proud => "praise",
+            Self::Angry => "angry_1",
+            Self::Sad => "emo_sad",
+            Self::Surprised => "emo_surprised",
+            Self::Sleepy => "tired",
+            Self::Thinking => "cheer",
+            Self::Cheer => "cheer",
+            Self::Affection => "greet",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn azure_action_hint(self) -> &'static str {
+        match self {
+            Self::Happy | Self::Proud | Self::Cheer => "talent",
+            Self::Shy | Self::Affection => "click",
+            Self::Sleepy => "sleep",
+            Self::Thinking | Self::Angry => "work",
+            Self::Sad | Self::Surprised => "emotion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmotionMatch {
+    pub bucket: EmotionBucket,
+    pub score: f64,
+}
+
+pub fn detect_reply_emotion(
+    reply_zh: &str,
+    reply_ja: Option<&str>,
+    user_text: &str,
+) -> Option<EmotionMatch> {
+    struct Rule {
+        bucket: EmotionBucket,
+        zh: &'static [&'static str],
+        ja: &'static [&'static str],
+        kaomoji: &'static [&'static str],
+    }
+
+    const RULES: &[Rule] = &[
+        Rule {
+            bucket: EmotionBucket::Happy,
+            zh: &[
+                "开心", "高兴", "太好了", "太棒", "好耶", "嘻嘻", "哈哈", "嘿嘿", "完美",
+                "搞定", "成功", "庆祝", "冲鸭", "欢呼", "爽", "绝了", "满分",
+            ],
+            ja: &[
+                "やった", "嬉しい", "うれしい", "最高", "すごい", "えへへ", "あはは", "わーい",
+                "大成功", "楽しい", "ナイス",
+            ],
+            kaomoji: &[
+                "(*^▽^*)", "(≧▽≦)", "(๑>◡<๑)", "^▽^", "≧▽≦", "✨", "🎉", "🥳", "😄", "😆",
+            ],
+        },
+        Rule {
+            bucket: EmotionBucket::Shy,
+            zh: &[
+                "害羞", "脸红", "唔", "讨厌", "别夸", "才没有", "才不是", "不好意思", "摸头",
+                "贴贴", "亲昵", "呆毛", "人家", "娇羞",
+            ],
+            ja: &[
+                "恥ずかし", "はずかし", "照れ", "べ、別に", "別に", "うぅ", "きゃっ", "もうっ",
+                "こほん",
+            ],
+            kaomoji: &[
+                "(*/ω\\*)", "(〃∀〃)", "(///▽///)", "(>_<)", "(つд⊂)", "😳", "👉👈",
+            ],
+        },
+        Rule {
+            bucket: EmotionBucket::Proud,
+            zh: &[
+                "哼", "小意思", "常规", "当然", "本小姐", "本学霸", "不在话下", "轻轻松松",
+                "那是自然", "厉害吧", "夸我", "骄傲", "得意", "信手拈来", "小菜一碟", "拿捏",
+                "包在我身上",
+            ],
+            ja: &["ふふん", "当然", "お手の物", "さすが", "どや", "余裕", "完璧"],
+            kaomoji: &["(￣▽￣)", "(｀・ω・´)", "(￣ω￣)", "(¬‿¬)", "😎", "😏", "👑"],
+        },
+        Rule {
+            bucket: EmotionBucket::Angry,
+            zh: &[
+                "生气", "气死", "哼！", "过分", "别戳", "放手", "无语", "罢工", "可恶",
+                "笨蛋", "欠揍", "忍不了", "皱眉", "啧", "离谱", "吐槽", "什么鬼",
+            ],
+            ja: &[
+                "怒", "ふんっ", "ちょっと！", "いい加減", "もう知らない", "ちっ", "むっ",
+                "やめて",
+            ],
+            kaomoji: &[
+                "(╬▔皿▔)", "(╯°□°", "(｀へ´)", "(-_-;)", "(눈_눈)", "💢", "😤", "😠", "🙄",
+            ],
+        },
+        Rule {
+            bucket: EmotionBucket::Sad,
+            zh: &[
+                "难过", "伤心", "委屈", "哭", "呜呜", "对不起", "抱歉", "心疼", "安慰",
+                "抱抱", "叹气", "沮丧", "好难", "失败", "崩溃", "压力大", "失落", "没关系",
+                "别难过",
+            ],
+            ja: &["悲しい", "ごめん", "泣", "寂しい", "つらい", "しょんぼり", "うぅ…"],
+            kaomoji: &["(T_T)", "(;_;)", "(´;ω;", "(╥﹏╥)", "(´･_･`)", "😢", "😭", "💧", "🥺"],
+        },
+        Rule {
+            bucket: EmotionBucket::Surprised,
+            zh: &[
+                "哇啊", "卧槽", "居然", "竟然", "天哪", "不会吧", "震惊", "惊讶", "吓我一跳",
+                "吓一跳", "真的吗", "什么？！", "？！", "!?", "我的天", "哇塞", "不可思议",
+            ],
+            ja: &["わっ！？", "えっ！？", "ええっ", "びっくり", "まさか", "うそ", "うわっ"],
+            kaomoji: &["(°Д°)", "(O_O)", "(⊙_⊙)", "∑(ﾟДﾟ)", "(ﾟдﾟ)", "😱", "😲", "🤯", "⁉️"],
+        },
+        Rule {
+            bucket: EmotionBucket::Sleepy,
+            zh: &[
+                "困", "好困", "想睡", "睡觉", "晚安", "熬夜", "好累", "累了", "疲惫",
+                "休息", "哈欠", "眯一会", "眼皮", "早点睡", "伸懒腰",
+            ],
+            ja: &["眠い", "ねむい", "おやすみ", "疲れ", "つかれ", "休もう", "スリープ", "あくび"],
+            kaomoji: &["(-_-)zzz", "(σω-)", "😴", "🥱", "💤", "🌙"],
+        },
+        Rule {
+            bucket: EmotionBucket::Thinking,
+            zh: &[
+                "想想", "思考", "推理", "分析", "怎么回事", "奇怪", "疑惑", "研究", "排查",
+                "定位", "逻辑", "原理", "拆解", "架构", "方案", "思路", "为什么", "嗯…",
+                "让我想想",
+            ],
+            ja: &["考え", "推論", "分析", "なるほど", "うーん", "不思議", "原因", "確認", "整理"],
+            kaomoji: &["(・_・?)", "(・・?)", "(?_?)", "🤔", "🧐", "💡", "🔍"],
+        },
+        Rule {
+            bucket: EmotionBucket::Cheer,
+            zh: &[
+                "加油", "冲", "干劲", "写代码", "搞起来", "打气", "没问题", "肯定行", "稳的",
+                "全力", "算力", "拉满", "debug", "重构", "上线", "必胜", "奥利给",
+            ],
+            ja: &["頑張", "がんば", "ファイト", "いくよ", "任せ", "フルパワー", "応援", "一緒に"],
+            kaomoji: &["(๑•̀ㅂ•́)و", "٩(ˊᗜˋ*)و", "(ง •̀_•́)ง", "💪", "🔥", "⚡", "🚀"],
+        },
+        Rule {
+            bucket: EmotionBucket::Affection,
+            zh: &[
+                "谢谢", "感谢", "早安", "早上好", "你好", "陪着你", "陪你", "在呢", "温柔",
+                "喜欢你", "比心", "爱了", "辛苦了", "贴心", "治愈", "欢迎", "挥手",
+            ],
+            ja: &[
+                "ありがとう", "感謝", "おはよう", "こんにちは", "そばに", "見守", "優しい",
+                "大好き", "よろしく",
+            ],
+            kaomoji: &[
+                "(｡･ω･｡)ﾉ♡", "(づ｡◕‿‿◕｡)づ", "(´▽｀)", "(♥ω♥*)", "❤️", "💖", "🌸", "👋",
+            ],
+        },
+    ];
+
+    let zh_lower = reply_zh.to_lowercase();
+    let user_lower = user_text.to_lowercase();
+    let ja_text = reply_ja.unwrap_or("");
+
+    let mut best: Option<EmotionMatch> = None;
+    for rule in RULES {
+        let mut score = 0.0;
+        for kw in rule.zh {
+            if zh_lower.contains(kw) {
+                score += 1.0;
+            }
+            if user_lower.contains(kw) {
+                score += 0.45;
+            }
+        }
+        if !ja_text.is_empty() {
+            for kw in rule.ja {
+                if ja_text.contains(kw) {
+                    score += 0.95;
+                }
+            }
+        }
+        for km in rule.kaomoji {
+            if reply_zh.contains(km) {
+                score += 1.5;
+            }
+            if user_text.contains(km) {
+                score += 0.8;
+            }
+        }
+        if score >= 1.0 && best.is_none_or(|b| score > b.score) {
+            best = Some(EmotionMatch {
+                bucket: rule.bucket,
+                score,
+            });
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -2200,5 +2690,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dual_lang_manifest_resolves_ja_zh_and_legacy() {
+        let cfg = ChatAiConfig::default();
+        assert_eq!(cfg.builtin_voice_lang, "ja");
+        assert_eq!(cfg.vram_mode, "balanced");
+        assert_eq!(cfg.vram_auto_unload_minutes, 5);
+
+        let tmp = std::env::temp_dir().join("deskpet_test_dual_lang_manifest");
+        let _ = fs::remove_dir_all(&tmp);
+        let ja_dir = tmp.join("chars/claude/voices/ja");
+        let zh_dir = tmp.join("chars/claude/voices/zh");
+        fs::create_dir_all(&ja_dir).unwrap();
+        fs::create_dir_all(&zh_dir).unwrap();
+        fs::write(ja_dir.join("greet.ogg"), b"OggSja").unwrap();
+        fs::write(zh_dir.join("greet.ogg"), b"OggSzh").unwrap();
+        fs::write(
+            ja_dir.join("manifest.json"),
+            r#"{"scenes":{"greet":{"file":"greet.ogg","text":"こんにちは","zhText":"你好呀"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            zh_dir.join("manifest.json"),
+            r#"{"scenes":{"greet":{"file":"greet.ogg","text":"你好呀"}}}"#,
+        )
+        .unwrap();
+
+        let (ja_text, ja_rel) =
+            load_voice_manifest_scene_for_lang(&tmp, "claude", "greet", "ja").unwrap();
+        assert_eq!(ja_text, "你好呀");
+        assert_eq!(ja_rel, "chars/claude/voices/ja/greet.ogg");
+
+        let (zh_text, zh_rel) =
+            load_voice_manifest_scene_for_lang(&tmp, "claude", "greet", "zh").unwrap();
+        assert_eq!(zh_text, "你好呀");
+        assert_eq!(zh_rel, "chars/claude/voices/zh/greet.ogg");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn builtin_bilingual_voice_covers_all_eight_chars_and_32_scenes() {
+        let chars = ["claude", "deepseek", "gemini", "glm", "gpt", "grok", "kimi", "qwen"];
+        let scenes = [
+            "click_1", "click_2", "feed", "drag", "praise", "hungry", "dance", "tired", "cheer",
+            "greet", "wake", "lunch", "dinner", "sleep", "work_start", "error", "approval", "done",
+            "pomodoro_done", "angry_1", "angry_2", "work_start_2", "done_2", "context_high",
+            "ambient_1", "ambient_2", "ambient_3", "ambient_4", "emo_happy", "emo_shy", "emo_sad",
+            "emo_surprised",
+        ];
+        for ch in chars {
+            for sc in scenes {
+                let zh = builtin_zh_voice_for_scene(ch, sc)
+                    .unwrap_or_else(|| panic!("missing zh line for {ch}/{sc}"));
+                assert!(!zh.is_empty(), "empty zh line for {ch}/{sc}");
+                let ja = builtin_ja_voice_for_scene(ch, sc)
+                    .unwrap_or_else(|| panic!("missing ja line for {ch}/{sc}"));
+                assert!(
+                    contains_japanese_kana(ja),
+                    "expected kana in {ch}/{sc}: {ja}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detect_reply_emotion_scores_zh_ja_and_kaomoji() {
+        assert_eq!(
+            detect_reply_emotion("太好了！终于搞定了！(≧▽≦)", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Happy)
+        );
+        assert_eq!(
+            detect_reply_emotion("唔…别这样夸我啦，才没有开心呢", Some("恥ずかしいです"), "")
+                .map(|m| m.bucket),
+            Some(EmotionBucket::Shy)
+        );
+        assert_eq!(
+            detect_reply_emotion("小意思，本学霸轻轻松松拿捏", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Proud)
+        );
+        assert_eq!(
+            detect_reply_emotion("别戳了！再戳要罢工了！(╬▔皿▔)", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Angry)
+        );
+        assert_eq!(
+            detect_reply_emotion("呜呜，抱歉让你失望了 (T_T)", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Sad)
+        );
+        assert_eq!(
+            detect_reply_emotion("哇啊？！居然直接跑通了！？", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Surprised)
+        );
+        assert_eq!(
+            detect_reply_emotion("好困呀，先去睡一觉吧 💤", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Sleepy)
+        );
+        assert_eq!(
+            detect_reply_emotion("让我想想这个架构的逻辑原理 🤔", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Thinking)
+        );
+        assert_eq!(
+            detect_reply_emotion("一起加油冲鸭！重构必胜 💪", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Cheer)
+        );
+        assert_eq!(
+            detect_reply_emotion("谢谢你一直陪着我呀 🌸", None, "").map(|m| m.bucket),
+            Some(EmotionBucket::Affection)
+        );
     }
 }

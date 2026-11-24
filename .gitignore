@@ -24,3 +24,6 @@ app/src-tauri/target/
 app/src-tauri/gen/
 *.log
 .DS_Store
+
+# 宣传视频 Remotion 工程与渲染产物隔离
+tools/video_maker/
