@@ -8,10 +8,10 @@ import {
   type CharState,
   type ChatAiConfig,
   type CompanionVoiceMode,
-  type GptSovitsCharProfile,
-  type GptSovitsConfig,
-  type GptSovitsProgressPayload,
-  type GptSovitsStatusPayload,
+  type FishSpeechCharProfile,
+  type FishSpeechConfig,
+  type FishSpeechProgressPayload,
+  type FishSpeechStatusPayload,
   type VramMode,
   type VramStatusPayload,
 } from "./shared/ipc";
@@ -52,7 +52,7 @@ const TAB_META: ReadonlyArray<{
     label: "语音与声优克隆",
     icon: "volumeOn",
     title: "语音与声优克隆",
-    sub: "GPT-SoVITS v2ProPlus（NVIDIA / AMD 分流）· Azure 女声 · 本地语音包",
+    sub: "Fish Speech v2ProPlus（NVIDIA / AMD 分流）· Azure 女声 · 本地语音包",
   },
   {
     id: "resources",
@@ -77,10 +77,24 @@ const TAB_META: ReadonlyArray<{
   },
 ];
 
-function createDefaultGptSovitsConfig(): GptSovitsConfig {
+function createDefaultFishSpeechConfig(): FishSpeechConfig {
   return {
+    enabled: false,
     installDir: "",
-    apiUrl: "http://127.0.0.1:9880",
+    apiUrl: "http://127.0.0.1:8080",
+    apiKey: "",
+    checkpointDir: "",
+    decoderCheckpoint: "",
+    decoderConfig: "modded_dac_vq",
+    device: "auto",
+    half: true,
+    timeoutSecs: 45,
+    chunkLength: 200,
+    topP: 0.8,
+    temperature: 0.8,
+    repetitionPenalty: 1.1,
+    maxNewTokens: 1024,
+    useMemoryCache: "on",
     downloadSource: "mirror",
     gpuBackend: "nvidia",
     autoStartService: false,
@@ -90,15 +104,13 @@ function createDefaultGptSovitsConfig(): GptSovitsConfig {
   };
 }
 
-function createDefaultCharProfile(): GptSovitsCharProfile {
+function createDefaultCharProfile(): FishSpeechCharProfile {
   return {
     refAudioPath: "",
     promptText: "",
     promptLang: "zh",
     textLang: "ja",
-    speedFactor: 1.0,
-    gptWeightsPath: "",
-    sovitsWeightsPath: "",
+    referenceId: "",
   };
 }
 
@@ -116,7 +128,7 @@ function createDefaultConfig(): ChatAiConfig {
     customVoice: "",
     charVoices: {},
     customPersonas: {},
-    gptSovits: createDefaultGptSovitsConfig(),
+    fishSpeech: createDefaultFishSpeechConfig(),
     builtinVoiceLang: "ja",
     vramMode: "balanced",
     vramAutoUnloadMinutes: 5,
@@ -209,13 +221,18 @@ export async function bootSettingsWindow(): Promise<void> {
     voicePackInstalled: false,
     chars: [],
   };
-  let gsStatus: GptSovitsStatusPayload = {
+  let gsStatus: FishSpeechStatusPayload = {
     state: "uninstalled",
     label: "未安装",
+    installed: false,
+    pythonReady: false,
+    modelReady: false,
+    running: false,
+    pid: null,
+    apiUrl: "http://127.0.0.1:8080",
     installDir: "",
-    apiUrl: "http://127.0.0.1:9880",
-    missingFiles: [],
-    managedPid: null,
+    checkpointDir: "",
+    detectedCheckpoints: [],
     error: null,
   };
   let pickSeq = 0;
@@ -227,22 +244,22 @@ export async function bootSettingsWindow(): Promise<void> {
   ): void {
     const requestId = `pick_${++pickSeq}`;
     pendingPickCallbacks.set(requestId, onPicked);
-    void settingsSet("gptSovitsPickFile", { requestId, kind }).catch(() => {
+    void settingsSet("fishSpeechPickFile", { requestId, kind }).catch(() => {
       pendingPickCallbacks.delete(requestId);
     });
   }
 
-  function ensureGsConfig(): GptSovitsConfig {
-    if (!config.gptSovits) {
-      config.gptSovits = createDefaultGptSovitsConfig();
+  function ensureGsConfig(): FishSpeechConfig {
+    if (!config.fishSpeech) {
+      config.fishSpeech = createDefaultFishSpeechConfig();
     }
-    if (!config.gptSovits.charProfiles) {
-      config.gptSovits.charProfiles = {};
+    if (!config.fishSpeech.charProfiles) {
+      config.fishSpeech.charProfiles = {};
     }
-    return config.gptSovits;
+    return config.fishSpeech;
   }
 
-  function getCharProfile(charId: string): GptSovitsCharProfile {
+  function getCharProfile(charId: string): FishSpeechCharProfile {
     const gs = ensureGsConfig();
     if (!gs.charProfiles[charId]) {
       gs.charProfiles[charId] = createDefaultCharProfile();
@@ -498,7 +515,7 @@ export async function bootSettingsWindow(): Promise<void> {
     {
       id: "full_realtime" as VramMode,
       name: "满血实时克隆",
-      desc: "常驻 GPT-SoVITS · 16G+ 显存推荐",
+      desc: "常驻 Fish Speech · 16G+ 显存推荐",
     },
   ]) {
     const btn = document.createElement("button");
@@ -577,11 +594,11 @@ export async function bootSettingsWindow(): Promise<void> {
       vramFill.dataset.level = v.usedPct >= 85 ? "high" : v.usedPct >= 65 ? "mid" : "ok";
     } else {
       vramGpuLabel.textContent = v.gpuName || "未检测到独立显卡计数器";
-      vramUsageText.textContent = v.moemateGptSovitsRunning ? "GPT-SoVITS 运行中" : "MoeMate 0 MB";
+      vramUsageText.textContent = v.moemateFishSpeechRunning ? "Fish Speech 运行中" : "MoeMate 0 MB";
       vramFill.style.width = "0%";
       vramFill.dataset.level = "ok";
     }
-    vramReleaseBtn.disabled = !v.moemateGptSovitsRunning;
+    vramReleaseBtn.disabled = !v.moemateFishSpeechRunning;
 
     vramProcsWrap.replaceChildren();
     if (v.processes.length > 0) {
@@ -638,7 +655,7 @@ export async function bootSettingsWindow(): Promise<void> {
   engineCardsWrap.className = "sw-engine-cards";
   const engineCardBtns = new Map<string, HTMLButtonElement>();
   for (const m of [
-    { id: "gpt_sovits", name: "GPT-SoVITS 克隆", desc: "本地 8 声优日语配音" },
+    { id: "fish_speech", name: "Fish Speech 克隆", desc: "本地 8 声优日语配音" },
     { id: "azure", name: "Azure 旗舰女声", desc: "云端超拟真中文语音" },
     { id: "local", name: "仅本地离线包", desc: "0ms 秒播内置语音" },
   ]) {
@@ -655,10 +672,10 @@ export async function bootSettingsWindow(): Promise<void> {
     btn.addEventListener("click", () => {
       config.ttsMode = m.id as ChatAiConfig["ttsMode"];
       syncUi();
-      if (config.ttsMode === "gpt_sovits") {
-        void settingsSet("gptSovitsStatus", {
+      if (config.ttsMode === "fish_speech") {
+        void settingsSet("fishSpeechStatus", {
           installDir: gsInstallDirInput.value.trim(),
-          apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:9880",
+          apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:8080",
         }).catch(() => {});
       }
     });
@@ -788,16 +805,16 @@ export async function bootSettingsWindow(): Promise<void> {
   );
   voicePage.appendChild(companionCard);
 
-  /* ----- GPT-SoVITS v2ProPlus 服务管理卡 ----- */
-  const gptSovitsCard = document.createElement("div");
-  gptSovitsCard.className = "sw-card";
+  /* ----- Fish Speech v2ProPlus 服务管理卡 ----- */
+  const fishSpeechCard = document.createElement("div");
+  fishSpeechCard.className = "sw-card";
   const gsStatusRow = document.createElement("div");
   gsStatusRow.className = "sw-status-row";
   const gsStatusLeft = document.createElement("div");
   gsStatusLeft.className = "sw-status-left";
   const gsCardTitle = document.createElement("span");
   gsCardTitle.className = "sw-card-title";
-  gsCardTitle.textContent = "GPT-SoVITS v2ProPlus 本地引擎";
+  gsCardTitle.textContent = "Fish Speech v2ProPlus 本地引擎";
   const gsStatusDot = document.createElement("span");
   gsStatusDot.className = "sw-status-dot";
   gsStatusDot.dataset.state = "uninstalled";
@@ -811,9 +828,9 @@ export async function bootSettingsWindow(): Promise<void> {
   gsRefreshBtn.className = "ip-mini-pill-btn";
   gsRefreshBtn.textContent = "检测状态";
   gsRefreshBtn.addEventListener("click", () => {
-    void settingsSet("gptSovitsStatus", {
+    void settingsSet("fishSpeechStatus", {
       installDir: gsInstallDirInput.value.trim(),
-      apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:9880",
+      apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:8080",
     }).catch(() => {});
   });
   gsStatusRow.append(gsStatusLeft, gsRefreshBtn);
@@ -848,8 +865,8 @@ export async function bootSettingsWindow(): Promise<void> {
     },
     {
       id: "amd",
-      name: "AMD 显卡（实验性）",
-      desc: "ZLUDA 转译 · 适配性较差",
+      name: "AMD 显卡（ROCm / ZLUDA）",
+      desc: "原生 Windows ROCm (gfx103X) 或 ZLUDA",
     },
   ]) {
     const btn = document.createElement("button");
@@ -875,14 +892,14 @@ export async function bootSettingsWindow(): Promise<void> {
   gsAmdWarnBox.className = "sw-amd-warn";
   gsAmdWarnBox.hidden = true;
   gsAmdWarnBox.textContent =
-    "⚠️ 适配性警告：AMD 显卡依赖 ROCm 5.7 + ZLUDA 转译层，不同显卡型号与驱动适配性较差、首次合成需编译 GPU 内核且可能出现兼容报错（目前仅在 RX 6000 系列验证通过）。如遇到报错，建议前往「角色与语音下载」下载日语预设语音包或使用云端语音。";
+    "提示：AMD 显卡优先使用全局原生 Windows ROCm（gfx103X / TheRock）加速；若未配置全局 ROCm，也可使用 ZLUDA 转译层。";
 
   const gsDirRow = document.createElement("div");
   gsDirRow.className = "ip-field-row";
   const gsInstallDirInput = document.createElement("input");
   gsInstallDirInput.type = "text";
   gsInstallDirInput.className = "ip-field-input";
-  gsInstallDirInput.placeholder = "引擎目录（默认 ./runtime_engines/gpt-sovits/）";
+  gsInstallDirInput.placeholder = "引擎目录（默认 %APPDATA%\\Deskpet\\runtime_engines\\fish-speech）";
   gsInstallDirInput.addEventListener("input", () => {
     ensureGsConfig().installDir = gsInstallDirInput.value.trim();
   });
@@ -895,16 +912,16 @@ export async function bootSettingsWindow(): Promise<void> {
       if (!path) return;
       gsInstallDirInput.value = path;
       ensureGsConfig().installDir = path;
-      void settingsSet("gptSovitsStatus", {
+      void settingsSet("fishSpeechStatus", {
         installDir: path,
-        apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:9880",
+        apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:8080",
       }).catch(() => {});
     });
   });
   const gsApiUrlInput = document.createElement("input");
   gsApiUrlInput.type = "text";
   gsApiUrlInput.className = "ip-field-input is-region";
-  gsApiUrlInput.placeholder = "http://127.0.0.1:9880";
+  gsApiUrlInput.placeholder = "http://127.0.0.1:8080";
   gsApiUrlInput.addEventListener("input", () => {
     ensureGsConfig().apiUrl = gsApiUrlInput.value.trim();
   });
@@ -919,8 +936,8 @@ export async function bootSettingsWindow(): Promise<void> {
   gsInstallBtn.addEventListener("click", () => {
     const gs = ensureGsConfig();
     gs.installDir = gsInstallDirInput.value.trim();
-    gs.apiUrl = gsApiUrlInput.value.trim() || "http://127.0.0.1:9880";
-    void settingsSet("gptSovitsInstall", {
+    gs.apiUrl = gsApiUrlInput.value.trim() || "http://127.0.0.1:8080";
+    void settingsSet("fishSpeechInstall", {
       installDir: gs.installDir,
       downloadSource: gs.downloadSource,
       gpuBackend: gs.gpuBackend || "nvidia",
@@ -933,17 +950,17 @@ export async function bootSettingsWindow(): Promise<void> {
   gsCancelBtn.textContent = "取消下载";
   gsCancelBtn.hidden = true;
   gsCancelBtn.addEventListener("click", () => {
-    void settingsSet("gptSovitsCancelInstall", true).catch(() => {});
+    void settingsSet("fishSpeechCancelInstall", true).catch(() => {});
   });
   const gsStartBtn = document.createElement("button");
   gsStartBtn.type = "button";
   gsStartBtn.className = "ip-mini-pill-btn";
   gsStartBtn.textContent = "启动引擎";
   gsStartBtn.addEventListener("click", () => {
-    statusEl.textContent = "正在拉起 GPT-SoVITS 本地服务…";
-    void settingsSet("gptSovitsStart", {
+    statusEl.textContent = "正在拉起 Fish Speech 本地服务…";
+    void settingsSet("fishSpeechStart", {
       installDir: gsInstallDirInput.value.trim(),
-      apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:9880",
+      apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:8080",
     }).catch(() => {});
   });
   const gsStopBtn = document.createElement("button");
@@ -951,9 +968,9 @@ export async function bootSettingsWindow(): Promise<void> {
   gsStopBtn.className = "ip-mini-pill-btn";
   gsStopBtn.textContent = "停止引擎";
   gsStopBtn.addEventListener("click", () => {
-    void settingsSet("gptSovitsStop", {
+    void settingsSet("fishSpeechStop", {
       installDir: gsInstallDirInput.value.trim(),
-      apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:9880",
+      apiUrl: gsApiUrlInput.value.trim() || "http://127.0.0.1:8080",
     }).catch(() => {});
   });
   gsBtnRow.append(gsInstallBtn, gsCancelBtn, gsStartBtn, gsStopBtn);
@@ -990,7 +1007,7 @@ export async function bootSettingsWindow(): Promise<void> {
   );
   const gsDailyVoiceToggle = createToggleSwitchRow(
     "日常互动与提醒全覆盖克隆配音",
-    "点击/拖拽/投喂/久坐/作息/番茄钟均走 GPT-SoVITS 日语配音",
+    "点击/拖拽/投喂/久坐/作息/番茄钟均走 Fish Speech 日语配音",
     () => {
       const gs = ensureGsConfig();
       gs.dailyDynamicVoice = !(gs.dailyDynamicVoice ?? true);
@@ -998,7 +1015,7 @@ export async function bootSettingsWindow(): Promise<void> {
     },
   );
 
-  gptSovitsCard.append(
+  fishSpeechCard.append(
     gsStatusRow,
     gsSourceStrip,
     gsGpuGrid,
@@ -1061,7 +1078,7 @@ export async function bootSettingsWindow(): Promise<void> {
     const voice = config.charVoices[selectedCharId] ?? "";
     const gs = ensureGsConfig();
     gs.installDir = gsInstallDirInput.value.trim();
-    gs.apiUrl = gsApiUrlInput.value.trim() || "http://127.0.0.1:9880";
+    gs.apiUrl = gsApiUrlInput.value.trim() || "http://127.0.0.1:8080";
     const charProf = getCharProfile(selectedCharId);
     const customLine = gsPreviewTextInput.value.trim();
     const previewLine =
@@ -1081,8 +1098,8 @@ export async function bootSettingsWindow(): Promise<void> {
     statusEl.textContent =
       config.ttsMode === "local"
         ? "正在试听本地情绪语音包…"
-        : config.ttsMode === "gpt_sovits"
-          ? "正在合成 GPT-SoVITS 克隆试听…"
+        : config.ttsMode === "fish_speech"
+          ? "正在合成 Fish Speech 克隆试听…"
           : "正在试听 Azure 旗舰女声…";
     void settingsSet("ttsPreview", {
       charId: selectedCharId,
@@ -1090,7 +1107,7 @@ export async function bootSettingsWindow(): Promise<void> {
       ttsMode: config.ttsMode,
       azureSpeechKey: azureKeyInput.value.trim(),
       azureSpeechRegion: azureRegionInput.value.trim() || "eastasia",
-      gptSovits: previewGs,
+      fishSpeech: previewGs,
       builtinVoiceLang: config.builtinVoiceLang || "ja",
       text: previewLine,
     }).catch(() => {});
@@ -1255,92 +1272,31 @@ export async function bootSettingsWindow(): Promise<void> {
   gsPreviewTextInput.placeholder = getDefaultPreviewLine(selectedCharId, "ja");
   previewTextCol.append(previewTextHead, gsPreviewTextInput);
 
-  const speedCol = document.createElement("div");
-  speedCol.className = "sw-field-col";
-  const speedHead = document.createElement("div");
-  speedHead.className = "ip-row-between";
-  const speedLbl = document.createElement("span");
-  speedLbl.className = "sw-field-label";
-  speedLbl.textContent = "语速微调 (0.8 ~ 1.3)";
-  const gsSpeedValEl = document.createElement("span");
-  gsSpeedValEl.className = "sw-hint";
-  gsSpeedValEl.textContent = "1.00x";
-  speedHead.append(speedLbl, gsSpeedValEl);
-
-  const gsSpeedInput = document.createElement("input");
-  gsSpeedInput.type = "range";
-  gsSpeedInput.className = "sw-range-input";
-  gsSpeedInput.min = "0.8";
-  gsSpeedInput.max = "1.3";
-  gsSpeedInput.step = "0.05";
-  gsSpeedInput.value = "1.0";
-  gsSpeedInput.addEventListener("input", () => {
-    const v = Number(gsSpeedInput.value) || 1.0;
-    getCharProfile(selectedCharId).speedFactor = v;
-    gsSpeedValEl.textContent = `${v.toFixed(2)}x`;
-  });
-  speedCol.append(speedHead, gsSpeedInput);
-
   const advDetails = document.createElement("details");
   advDetails.className = "sw-details";
   const advSummary = document.createElement("summary");
   advSummary.className = "sw-details-summary";
-  advSummary.textContent = "进阶：角色专属微调权重覆盖（.ckpt / .pth，可选）";
+  advSummary.textContent = "进阶：服务端预设参考音色 ID（reference_id，留空使用上方参考音频）";
   const advBody = document.createElement("div");
   advBody.className = "sw-details-body";
 
-  const gptWRow = document.createElement("div");
-  gptWRow.className = "ip-field-row";
-  const gsGptWeightInput = document.createElement("input");
-  gsGptWeightInput.type = "text";
-  gsGptWeightInput.className = "ip-field-input";
-  gsGptWeightInput.placeholder = "GPT 权重路径 (.ckpt，留空沿用基础模型)";
-  gsGptWeightInput.addEventListener("input", () => {
-    getCharProfile(selectedCharId).gptWeightsPath = gsGptWeightInput.value.trim();
+  const refIdRow = document.createElement("div");
+  refIdRow.className = "ip-field-row";
+  const fsRefIdInput = document.createElement("input");
+  fsRefIdInput.type = "text";
+  fsRefIdInput.className = "ip-field-input";
+  fsRefIdInput.placeholder = "服务端 reference_id（可选，如 char_neko）";
+  fsRefIdInput.addEventListener("input", () => {
+    getCharProfile(selectedCharId).referenceId = fsRefIdInput.value.trim();
   });
-  const gsPickGptBtn = document.createElement("button");
-  gsPickGptBtn.type = "button";
-  gsPickGptBtn.className = "ip-mini-pill-btn";
-  gsPickGptBtn.textContent = "选择 .ckpt";
-  gsPickGptBtn.addEventListener("click", () => {
-    const targetChar = selectedCharId;
-    requestNativePick("ckpt", (path) => {
-      if (!path) return;
-      getCharProfile(targetChar).gptWeightsPath = path;
-      if (selectedCharId === targetChar) gsGptWeightInput.value = path;
-    });
-  });
-  gptWRow.append(gsGptWeightInput, gsPickGptBtn);
+  refIdRow.append(fsRefIdInput);
 
-  const sovitsWRow = document.createElement("div");
-  sovitsWRow.className = "ip-field-row";
-  const gsSovitsWeightInput = document.createElement("input");
-  gsSovitsWeightInput.type = "text";
-  gsSovitsWeightInput.className = "ip-field-input";
-  gsSovitsWeightInput.placeholder = "SoVITS 权重路径 (.pth，留空沿用基础模型)";
-  gsSovitsWeightInput.addEventListener("input", () => {
-    getCharProfile(selectedCharId).sovitsWeightsPath = gsSovitsWeightInput.value.trim();
-  });
-  const gsPickSovitsBtn = document.createElement("button");
-  gsPickSovitsBtn.type = "button";
-  gsPickSovitsBtn.className = "ip-mini-pill-btn";
-  gsPickSovitsBtn.textContent = "选择 .pth";
-  gsPickSovitsBtn.addEventListener("click", () => {
-    const targetChar = selectedCharId;
-    requestNativePick("pth", (path) => {
-      if (!path) return;
-      getCharProfile(targetChar).sovitsWeightsPath = path;
-      if (selectedCharId === targetChar) gsSovitsWeightInput.value = path;
-    });
-  });
-  sovitsWRow.append(gsSovitsWeightInput, gsPickSovitsBtn);
-
-  advBody.append(gptWRow, sovitsWRow);
+  advBody.append(refIdRow);
   advDetails.append(advSummary, advBody);
 
-  gsCharBox.append(refCol, promptCol, langGrid, previewTextCol, speedCol, advDetails);
+  gsCharBox.append(refCol, promptCol, langGrid, previewTextCol, advDetails);
   charVoiceCard.append(cvHead, voiceCharGrid, voiceSelect, gsCharBox);
-  voicePage.append(vramCard, engineCard, gptSovitsCard, charVoiceCard);
+  voicePage.append(vramCard, engineCard, fishSpeechCard, charVoiceCard);
 
   /* ===== 页签 3：角色性格定制 ===== */
   const personaPage = document.createElement("div");
@@ -1746,7 +1702,7 @@ export async function bootSettingsWindow(): Promise<void> {
   sysCareLine1.textContent = "• 智能久坐提醒：连续专注写代码满 45 分钟后，仅在 Agent 回归 Idle 时弹泡并播放角色提醒语音。";
   const sysCareLine2 = document.createElement("div");
   sysCareLine2.className = "sw-hint";
-  sysCareLine2.textContent = "• 本体零捆绑策略：GPT-SoVITS v2ProPlus 引擎与权重按需隔离于独立目录，不打包进主程序。";
+  sysCareLine2.textContent = "• 本体零捆绑策略：Fish Speech v2ProPlus 引擎与权重按需隔离于独立目录，不打包进主程序。";
   sysCareCard.append(sysCareLbl, sysCareLine1, sysCareLine2);
 
   systemPage.append(sysBootCard, sysDevCard, sysCareCard);
@@ -1810,7 +1766,7 @@ export async function bootSettingsWindow(): Promise<void> {
     hotkeyToggle.setOn(globalHotkeyEnabled);
 
     const activeMode =
-      config.ttsMode === "local" || config.ttsMode === "gpt_sovits"
+      config.ttsMode === "local" || config.ttsMode === "fish_speech"
         ? config.ttsMode
         : "azure";
     for (const [id, btn] of engineCardBtns.entries()) {
@@ -1834,7 +1790,7 @@ export async function bootSettingsWindow(): Promise<void> {
       btn.dataset.active = activeLang === id ? "true" : "false";
     }
 
-    const isGptSovits = activeMode === "gpt_sovits";
+    const isFishSpeech = activeMode === "fish_speech";
     azureBox.hidden = activeMode !== "azure";
 
     const gs = ensureGsConfig();
@@ -1861,11 +1817,11 @@ export async function bootSettingsWindow(): Promise<void> {
     gsStartBtn.disabled = gsStatus.state === "running" || gsStatus.state === "installing";
     gsStopBtn.disabled = gsStatus.state !== "running";
 
-    cvLbl.textContent = isGptSovits
-      ? "8 角色独立声优克隆（GPT-SoVITS）"
+    cvLbl.textContent = isFishSpeech
+      ? "8 角色独立声优克隆（Fish Speech）"
       : "8 角色纯女声配置（已过滤全部男声）";
-    voiceSelect.hidden = isGptSovits;
-    gsCharBox.hidden = !isGptSovits;
+    voiceSelect.hidden = isFishSpeech;
+    gsCharBox.hidden = !isFishSpeech;
 
     for (const [id, btn] of voiceCharBtns.entries()) {
       btn.dataset.active = selectedCharId === id ? "true" : "false";
@@ -1882,11 +1838,7 @@ export async function bootSettingsWindow(): Promise<void> {
     gsPromptLangSelect.value = prof.promptLang || "zh";
     gsTextLangSelect.value = prof.textLang || "ja";
     gsPreviewTextInput.placeholder = getDefaultPreviewLine(selectedCharId, gsTextLangSelect.value);
-    const spd = Number.isFinite(prof.speedFactor) ? prof.speedFactor : 1.0;
-    gsSpeedInput.value = String(spd);
-    gsSpeedValEl.textContent = `${spd.toFixed(2)}x`;
-    gsGptWeightInput.value = prof.gptWeightsPath ?? "";
-    gsSovitsWeightInput.value = prof.sovitsWeightsPath ?? "";
+    fsRefIdInput.value = prof.referenceId ?? "";
 
     const p = CHAR_DEFAULT_PERSONAS[selectedCharId];
     const cMeta = getCharMeta(selectedCharId);
@@ -1897,14 +1849,14 @@ export async function bootSettingsWindow(): Promise<void> {
   }
 
   function applyConfigFromBackend(next: ChatAiConfig): void {
-    const incomingGs = next.gptSovits ?? createDefaultGptSovitsConfig();
+    const incomingGs = next.fishSpeech ?? createDefaultFishSpeechConfig();
     config = {
       ...createDefaultConfig(),
       ...next,
       charVoices: { ...(next.charVoices ?? {}) },
       customPersonas: { ...(next.customPersonas ?? {}) },
-      gptSovits: {
-        ...createDefaultGptSovitsConfig(),
+      fishSpeech: {
+        ...createDefaultFishSpeechConfig(),
         ...incomingGs,
         charProfiles: { ...(incomingGs.charProfiles ?? {}) },
       },
@@ -1914,15 +1866,15 @@ export async function bootSettingsWindow(): Promise<void> {
     modelInput.value = config.model ?? "";
     azureKeyInput.value = config.azureSpeechKey ?? "";
     azureRegionInput.value = config.azureSpeechRegion || "eastasia";
-    gsInstallDirInput.value = config.gptSovits?.installDir ?? "";
-    gsApiUrlInput.value = config.gptSovits?.apiUrl || "http://127.0.0.1:9880";
+    gsInstallDirInput.value = config.fishSpeech?.installDir ?? "";
+    gsApiUrlInput.value = config.fishSpeech?.apiUrl || "http://127.0.0.1:8080";
     syncUi();
   }
 
   async function saveAll(): Promise<void> {
     const gs = ensureGsConfig();
     gs.installDir = gsInstallDirInput.value.trim();
-    gs.apiUrl = gsApiUrlInput.value.trim() || "http://127.0.0.1:9880";
+    gs.apiUrl = gsApiUrlInput.value.trim() || "http://127.0.0.1:8080";
 
     const next: ChatAiConfig = {
       ...config,
@@ -1931,7 +1883,7 @@ export async function bootSettingsWindow(): Promise<void> {
       model: modelInput.value.trim() || "deepseek-chat",
       azureSpeechKey: azureKeyInput.value.trim(),
       azureSpeechRegion: azureRegionInput.value.trim() || "eastasia",
-      gptSovits: gs,
+      fishSpeech: gs,
     };
     saveBtn.disabled = true;
     statusEl.textContent = "保存中…";
@@ -2002,7 +1954,7 @@ export async function bootSettingsWindow(): Promise<void> {
     listen<VramStatusPayload>("pet_vram_status", (event) => {
       renderVramStatus(event.payload);
     }),
-    listen<GptSovitsStatusPayload>("pet_gpt_sovits_status", (event) => {
+    listen<FishSpeechStatusPayload>("pet_fish_speech_status", (event) => {
       gsStatus = event.payload;
       if (!gsInstallDirInput.value.trim() && event.payload.installDir) {
         gsInstallDirInput.value = event.payload.installDir;
@@ -2012,7 +1964,7 @@ export async function bootSettingsWindow(): Promise<void> {
       }
       syncUi();
     }),
-    listen<GptSovitsProgressPayload>("pet_gpt_sovits_progress", (event) => {
+    listen<FishSpeechProgressPayload>("pet_fish_speech_progress", (event) => {
       const p = event.payload;
       gsProgressWrap.hidden = !p.active && p.stage === "done";
       gsProgressFill.style.width = `${Math.max(0, Math.min(100, p.percent)).toFixed(1)}%`;

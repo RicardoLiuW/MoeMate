@@ -11,7 +11,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::gpt_sovits::{check_api_health, GptSovitsConfig, GptSovitsRuntime};
+use crate::fish_speech::{check_api_health, FishSpeechConfig, FishSpeechRuntime};
 use crate::stats::now_ms;
 
 #[cfg(windows)]
@@ -39,8 +39,8 @@ pub struct VramStatusPayload {
     pub used_mb: u64,
     pub total_mb: u64,
     pub used_pct: f64,
-    pub moemate_gpt_sovits_running: bool,
-    pub moemate_gpt_sovits_pid: Option<u32>,
+    pub moemate_fish_speech_running: bool,
+    pub moemate_fish_speech_pid: Option<u32>,
     pub moemate_estimated_mb: u64,
     pub processes: Vec<VramProcessInfo>,
     pub advice: String,
@@ -301,24 +301,20 @@ pub fn build_vram_advice(
         return "当前显存占用较高，建议开启「零显存 / 生图优先」或「均衡省显存」模式避免与出图/大模型冲突。".to_string();
     }
     if moemate_running && used_pct >= 70.0 {
-        return "GPT-SoVITS 语音引擎正在占用显存；如要同时生图或跑 14B 模型，可随时点击「释放语音显存」。".to_string();
+        return "Fish Speech 语音引擎正在占用显存；如要同时生图或跑 14B 模型，可随时点击「释放语音显存」。".to_string();
     }
     if moemate_running {
-        return "GPT-SoVITS 语音引擎运行中，当前显存余量充足。".to_string();
+        return "Fish Speech 语音引擎运行中，当前显存余量充足。".to_string();
     }
     "MoeMate 当前未占用本地语音显存（0 MB），离线语音包可 0ms 秒播。".to_string()
 }
 
 pub fn inspect_vram_status(
-    gs_cfg: &GptSovitsConfig,
-    gs_rt: &GptSovitsRuntime,
+    fs_cfg: &FishSpeechConfig,
+    fs_rt: &FishSpeechRuntime,
 ) -> VramStatusPayload {
-    let managed_pid = gs_rt
-        .process
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|c| c.id()));
-    let gs_running = check_api_health(&gs_cfg.api_url);
+    let managed_pid = fs_rt.current_pid();
+    let fs_running = fs_rt.is_running() || check_api_health(&fs_cfg.api_url).unwrap_or(false);
 
     let (available, gpu_name, backend, used_mb, total_mb, mut processes) =
         if let Some((name, used, total, procs)) = probe_nvidia_smi() {
@@ -341,13 +337,13 @@ pub fn inspect_vram_status(
         for p in &mut processes {
             if p.pid == pid {
                 p.source = "moemate".to_string();
-                p.name = format!("MoeMate GPT-SoVITS ({})", p.name);
+                p.name = format!("MoeMate Fish Speech ({})", p.name);
                 moemate_estimated_mb = p.used_mb;
             }
         }
     }
-    if gs_running && moemate_estimated_mb == 0 {
-        moemate_estimated_mb = 2600;
+    if fs_running && moemate_estimated_mb == 0 {
+        moemate_estimated_mb = 3600;
     }
 
     let ollama_procs = probe_ollama_running();
@@ -363,7 +359,7 @@ pub fn inspect_vram_status(
     } else {
         0.0
     };
-    let advice = build_vram_advice(available, total_mb, used_pct, gs_running, ollama_present);
+    let advice = build_vram_advice(available, total_mb, used_pct, fs_running, ollama_present);
 
     VramStatusPayload {
         available,
@@ -372,8 +368,8 @@ pub fn inspect_vram_status(
         used_mb,
         total_mb,
         used_pct,
-        moemate_gpt_sovits_running: gs_running,
-        moemate_gpt_sovits_pid: managed_pid,
+        moemate_fish_speech_running: fs_running,
+        moemate_fish_speech_pid: managed_pid,
         moemate_estimated_mb,
         processes,
         advice,

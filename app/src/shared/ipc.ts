@@ -451,25 +451,37 @@ export function setUiHitRects(rects: UiHitRect[]): Promise<boolean> {
 /* v2.2 AI 聊天与三层神经语音模型（走 settings_set 与内部事件）        */
 /* ------------------------------------------------------------------ */
 
-export interface GptSovitsCharProfile {
+export interface FishSpeechCharProfile {
   refAudioPath: string;
   promptText: string;
   promptLang: string;
   textLang: string;
-  speedFactor: number;
-  gptWeightsPath: string;
-  sovitsWeightsPath: string;
+  referenceId: string;
 }
 
-export interface GptSovitsConfig {
+export interface FishSpeechConfig {
+  enabled: boolean;
   installDir: string;
   apiUrl: string;
-  downloadSource: "mirror" | "official" | string;
-  gpuBackend?: "nvidia" | "amd" | string;
+  apiKey: string;
+  checkpointDir: string;
+  decoderCheckpoint: string;
+  decoderConfig: string;
+  device: string;
+  half: boolean;
+  timeoutSecs: number;
+  chunkLength: number;
+  topP: number;
+  temperature: number;
+  repetitionPenalty: number;
+  maxNewTokens: number;
+  useMemoryCache: string;
+  downloadSource: string;
+  gpuBackend?: string;
   autoStartService: boolean;
   autoStopOnExit: boolean;
   dailyDynamicVoice?: boolean;
-  charProfiles: Record<string, GptSovitsCharProfile>;
+  charProfiles: Record<string, FishSpeechCharProfile>;
 }
 
 export interface AssetCharPackStatus {
@@ -507,27 +519,31 @@ export interface AssetsProgressPayload {
   message: string;
 }
 
-export interface GptSovitsStatusPayload {
-  state: "uninstalled" | "installing" | "ready" | "running";
+export interface FishSpeechStatusPayload {
+  state: "uninstalled" | "installing" | "ready" | "running" | string;
   label: string;
-  installDir: string;
+  installed: boolean;
+  pythonReady: boolean;
+  modelReady: boolean;
+  running: boolean;
+  pid: number | null;
   apiUrl: string;
-  missingFiles: string[];
-  managedPid: number | null;
+  installDir: string;
+  checkpointDir: string;
+  detectedCheckpoints: string[];
   error: string | null;
 }
 
-export interface GptSovitsProgressPayload {
+export interface FishSpeechProgressPayload {
   active: boolean;
-  stage: "downloading" | "extracting" | "done" | "cancelled" | "error";
-  currentFile: string;
-  fileIndex: number;
-  fileTotal: number;
+  stage: string;
+  message: string;
+  percent: number;
   downloadedBytes: number;
   totalBytes: number;
-  percent: number;
   speedBps: number;
-  message: string;
+  done: boolean;
+  error: string | null;
 }
 
 export type BuiltinVoiceLang = "ja" | "zh";
@@ -548,8 +564,8 @@ export interface VramStatusPayload {
   usedMb: number;
   totalMb: number;
   usedPct: number;
-  moemateGptSovitsRunning: boolean;
-  moemateGptSovitsPid: number | null;
+  moemateFishSpeechRunning: boolean;
+  moemateFishSpeechPid: number | null;
   moemateEstimatedMb: number;
   processes: VramProcessInfo[];
   advice: string;
@@ -563,13 +579,13 @@ export interface ChatAiConfig {
   model: string;
   ttsEnabled: boolean;
   autoPlayVoice: boolean;
-  ttsMode: "azure" | "gpt_sovits" | "edge" | "local";
+  ttsMode: "azure" | "fish_speech" | "edge" | "local";
   azureSpeechKey: string;
   azureSpeechRegion: string;
   customVoice: string;
   charVoices: Record<string, string>;
   customPersonas: Record<string, string>;
-  gptSovits?: GptSovitsConfig;
+  fishSpeech?: FishSpeechConfig;
   builtinVoiceLang?: BuiltinVoiceLang;
   vramMode?: VramMode;
   vramAutoUnloadMinutes?: number;

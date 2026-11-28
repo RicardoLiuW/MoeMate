@@ -34,7 +34,7 @@ pub struct ChatAiConfig {
     pub tts_enabled: bool,
     #[serde(default = "default_true")]
     pub auto_play_voice: bool,
-    /// `"azure" | "gpt_sovits" | "edge" | "local"`
+    /// `"azure" | "fish_speech" | "edge" | "local"`
     #[serde(default = "default_tts_mode")]
     pub tts_mode: String,
     #[serde(default)]
@@ -51,8 +51,8 @@ pub struct ChatAiConfig {
     #[serde(default)]
     pub custom_personas: HashMap<String, String>,
     /// 本地开源语音引擎（GPT-SoVITS v2ProPlus / 自定义 API）配置
-    #[serde(default)]
-    pub gpt_sovits: crate::gpt_sovits::GptSovitsConfig,
+    #[serde(default, alias = "gptSovits")]
+    pub fish_speech: crate::fish_speech::FishSpeechConfig,
     /// 内置离线语音包语种：`"ja" | "zh"`（默认 `"ja"`）
     #[serde(default = "default_builtin_voice_lang")]
     pub builtin_voice_lang: String,
@@ -152,7 +152,7 @@ impl Default for ChatAiConfig {
             custom_voice: String::new(),
             char_voices: HashMap::new(),
             custom_personas: HashMap::new(),
-            gpt_sovits: crate::gpt_sovits::GptSovitsConfig::default(),
+            fish_speech: crate::fish_speech::FishSpeechConfig::default(),
             builtin_voice_lang: default_builtin_voice_lang(),
             vram_mode: default_vram_mode(),
             vram_auto_unload_minutes: default_vram_auto_unload_minutes(),
@@ -1964,13 +1964,13 @@ fn translate_zh_to_ja_via_llm(cfg: &ChatAiConfig, char_id: &str, zh_text: &str) 
 
 /// 当角色配置为日语语音输出（`text_lang == "ja" | "all_ja"`）时，
 /// 界面气泡保持中文 `clean_display_text`，语音合成自动转换为对应日语台词。
-pub fn resolve_voice_script_for_gpt_sovits(
+pub fn resolve_voice_script_for_fish_speech(
     cfg: &ChatAiConfig,
     char_id: &str,
     clean_display_text: &str,
 ) -> String {
     let want_ja_voice = cfg
-        .gpt_sovits
+        .fish_speech
         .char_profiles
         .get(char_id)
         .map(|p| matches!(p.text_lang.trim(), "ja" | "all_ja"))
@@ -1999,15 +1999,15 @@ pub fn resolve_voice_script_for_gpt_sovits(
 /// 返回 `(PetTtsPayload, 可选降级提示)`；若仅文字展示则返回 `Err(温和原因)`。
 pub fn build_tts_payload(
     assets_root: &Path,
-    base_root: &Path,
-    cache_dir: &Path,
+    _base_root: &Path,
+    _cache_dir: &Path,
     cfg: &ChatAiConfig,
     char_id: &str,
     user_text: &str,
     reply_text: &str,
     binding: &str,
     prefer_dynamic: bool,
-    gpt_runtime: &crate::gpt_sovits::GptSovitsRuntime,
+    fish_runtime: &crate::fish_speech::FishSpeechRuntime,
 ) -> Result<(PetTtsPayload, Option<String>), String> {
     let profile = character_voice_profile(char_id, &cfg.char_voices, &cfg.custom_voice);
     let vram_mode = normalize_vram_mode(&cfg.vram_mode);
@@ -2047,23 +2047,7 @@ pub fn build_tts_payload(
     };
 
     if vram_mode == "zero_vram" {
-        let (clean_reply, _) = extract_action_tag(reply_text);
-        if let Some(cached_wav) =
-            crate::gpt_sovits::lookup_cached_wav(cache_dir, &cfg.gpt_sovits, char_id, &clean_reply)
-        {
-            return Ok((
-                PetTtsPayload {
-                    char_id: char_id.to_string(),
-                    text: clean_reply,
-                    kind: "wav_base64".to_string(),
-                    data: base64_encode(&cached_wav),
-                    rate: 1.0,
-                    pitch: 1.0,
-                    force: false,
-                },
-                None,
-            ));
-        }
+        let _ = _cache_dir;
         if let Some(local) = try_local_pack() {
             return Ok((local, None));
         }
@@ -2094,15 +2078,16 @@ pub fn build_tts_payload(
         return Err("当前为「零显存 / 生图优先」模式，未命中本地语音缓存".to_string());
     }
 
-    if cfg.tts_mode == "gpt_sovits" {
-        if !prefer_dynamic && (vram_mode == "balanced" || !cfg.gpt_sovits.daily_dynamic_voice) {
+    let _ = fish_runtime;
+    if cfg.tts_mode == "fish_speech" {
+        if !prefer_dynamic && vram_mode == "balanced" {
             if let Some(local) = try_local_pack() {
                 return Ok((local, None));
             }
         }
         let (clean_reply, _) = extract_action_tag(reply_text);
         let want_ja = cfg
-            .gpt_sovits
+            .fish_speech
             .char_profiles
             .get(char_id)
             .map(|p| matches!(p.text_lang.trim(), "ja" | "all_ja"))
@@ -2116,17 +2101,16 @@ pub fn build_tts_payload(
             None
         };
         let voice_script = scene_ja.unwrap_or_else(|| {
-            resolve_voice_script_for_gpt_sovits(cfg, char_id, &clean_reply)
+            resolve_voice_script_for_fish_speech(cfg, char_id, &clean_reply)
         });
-        match crate::gpt_sovits::synthesize_gpt_sovits_wav(
-            base_root,
-            cache_dir,
-            &cfg.gpt_sovits,
-            char_id,
+        let fs_profile = cfg.fish_speech.char_profiles.get(char_id);
+        match crate::fish_speech::synthesize_fish_speech_wav(
+            &cfg.fish_speech,
             &voice_script,
-            gpt_runtime,
+            fs_profile,
         ) {
             Ok(wav) => {
+                fish_runtime.touch_used();
                 return Ok((
                     PetTtsPayload {
                         char_id: char_id.to_string(),
@@ -2217,25 +2201,24 @@ pub fn build_tts_payload(
 /// - `tts_mode == "azure"` 且已填 Azure Key 时实时调用 Azure AI Speech 试听所选旗舰纯女声。
 pub fn build_preview_tts_payload(
     assets_root: &Path,
-    base_root: &Path,
-    cache_dir: &Path,
+    _base_root: &Path,
+    _cache_dir: &Path,
     cfg: &ChatAiConfig,
     char_id: &str,
     seq: u64,
     fallback_text: &str,
-    gpt_runtime: &crate::gpt_sovits::GptSovitsRuntime,
+    fish_runtime: &crate::fish_speech::FishSpeechRuntime,
 ) -> Result<(Option<String>, PetTtsPayload, String), String> {
     let vram_mode = normalize_vram_mode(&cfg.vram_mode);
-    if vram_mode != "zero_vram" && cfg.tts_mode == "gpt_sovits" {
+    let _ = fish_runtime;
+    if vram_mode != "zero_vram" && cfg.tts_mode == "fish_speech" {
         let (clean_preview, _) = extract_action_tag(fallback_text);
-        let voice_script = resolve_voice_script_for_gpt_sovits(cfg, char_id, &clean_preview);
-        let wav = crate::gpt_sovits::synthesize_gpt_sovits_wav(
-            base_root,
-            cache_dir,
-            &cfg.gpt_sovits,
-            char_id,
+        let voice_script = resolve_voice_script_for_fish_speech(cfg, char_id, &clean_preview);
+        let profile = cfg.fish_speech.char_profiles.get(char_id);
+        let wav = crate::fish_speech::synthesize_fish_speech_wav(
+            &cfg.fish_speech,
             &voice_script,
-            gpt_runtime,
+            profile,
         )?;
         return Ok((
             Some(clean_preview.clone()),
@@ -2300,14 +2283,14 @@ pub fn build_preview_tts_payload(
 #[allow(clippy::too_many_arguments)]
 pub fn build_scene_tts_payload(
     assets_root: &Path,
-    base_root: &Path,
-    cache_dir: &Path,
+    _base_root: &Path,
+    _cache_dir: &Path,
     cfg: &ChatAiConfig,
     char_id: &str,
     scene_key: &str,
     fallback_zh_line: &str,
     force: bool,
-    gpt_runtime: &crate::gpt_sovits::GptSovitsRuntime,
+    _fish_runtime: &crate::fish_speech::FishSpeechRuntime,
 ) -> Option<PetTtsPayload> {
     let fallback_key = match scene_key {
         "pomodoro_done" | "done_2" => Some("done"),
@@ -2334,9 +2317,9 @@ pub fn build_scene_tts_payload(
         }
     }
 
-    if vram_mode != "zero_vram" && cfg.tts_mode == "gpt_sovits" && cfg.gpt_sovits.daily_dynamic_voice {
+    if vram_mode != "zero_vram" && cfg.tts_mode == "fish_speech" {
         let want_ja = cfg
-            .gpt_sovits
+            .fish_speech
             .char_profiles
             .get(char_id)
             .map(|p| matches!(p.text_lang.trim(), "ja" | "all_ja"))
@@ -2344,17 +2327,15 @@ pub fn build_scene_tts_payload(
         let voice_script = if want_ja {
             builtin_ja_voice_for_scene(char_id, scene_key)
                 .map(str::to_string)
-                .unwrap_or_else(|| resolve_voice_script_for_gpt_sovits(cfg, char_id, fallback_zh_line))
+                .unwrap_or_else(|| resolve_voice_script_for_fish_speech(cfg, char_id, fallback_zh_line))
         } else {
             fallback_zh_line.to_string()
         };
-        if let Ok(wav) = crate::gpt_sovits::synthesize_gpt_sovits_wav(
-            base_root,
-            cache_dir,
-            &cfg.gpt_sovits,
-            char_id,
+        let profile = cfg.fish_speech.char_profiles.get(char_id);
+        if let Ok(wav) = crate::fish_speech::synthesize_fish_speech_wav(
+            &cfg.fish_speech,
             &voice_script,
-            gpt_runtime,
+            profile,
         ) {
             return Some(PetTtsPayload {
                 char_id: char_id.to_string(),

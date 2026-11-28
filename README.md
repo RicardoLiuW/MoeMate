@@ -10,14 +10,14 @@
 - **零延迟跟手拖拽与贴边「暗中观察」**：Win32 250Hz 非阻塞光标跟随 + 前端 `dragSlot` 预热槽；支持桌面左右边缘 62% 深藏身吸附、14° 歪头探望、悬停平滑探出、周期呼吸微动、贴边逆变换精准点击及多显示器坐标钳位。
 - **8 位角色与 1044 段高清动作**：1280×720 / 30fps VP9-alpha 透明 WebM；支持全库 `safeStartMs` 跳过脏首帧与 164 段 `sustainLoop` 中段无缝交叉淡化循环；首次打包本体零内置素材，支持同仓库 Releases 按需勾选下载。
 - **7 级优先级与三层呼吸调度器**：`DRAG(100)` > `CLICK(80)` > `COMMAND(60)` > `AGENT_ALERT(50)` > `SCHEDULE(40)` > `FOREGROUND_WORK(30)` > `IDLE(10)`，非工作态采用静息 55% / 日常玩乐干饭 30% / 才艺节日彩蛋 15% 三层呼吸调度 + 2h 去重加权；左键单击提供弹簧压扁回弹与五声音阶轻音效，3s 内连点 ≥5 次触发专属生气动画与语音。
-- **柔萌马卡龙手账风 UI（v3.0.1）**：奶油手账 / 星糖暗夜双外观、8 角色马卡龙主题、8 角色像素风头像（`28×28` 清晰点阵）、全站零 `backdrop-filter`（防 Windows WebView2 透明窗口闪烁）；桌面与系统托盘采用 Gemini 头像图标。
+- **柔萌马卡龙手账风 UI（v3.1.0）**：奶油手账 / 星糖暗夜双外观、8 角色马卡龙主题、8 角色像素风头像（`28×28` 清晰点阵）、全站零 `backdrop-filter`（防 Windows WebView2 透明窗口闪烁）；桌面与系统托盘采用 Gemini 头像图标。
   - **头顶双形态灵动岛**：完整态 + 极简胶囊，集成 `t/s` 速率脉冲、多模型池额度条、上下文一键续命、独立番茄钟胶囊与空素材引导按钮。
   - **四页签整合工作台**：集成「状态 / 伙伴 / 相册 / 闲聊」，支持动作搜索、随机播放与快捷词片，自由聊天基于 10 桶中/日关键词 + 颜文字情绪识别精确匹配动作。
   - **720×560 左右分栏设置中心**：覆盖「AI 对话模型 / 语音与显存管理 / 角色与语音下载 / 角色性格定制 / 系统与开发者」（支持 `Ctrl+S` 快捷保存）。
 - **AI 对话、三档显存模式与 512 条双语离线语音**：
   - OpenAI 兼容接口（WinHTTP 原生客户端，支持 DeepSeek / Gemini / Qwen / GLM / Kimi / 硅基流动 / OpenAI / 自定义端点）。
-  - Galgame「中文字幕 · 逐句完整日语配音」双语模式：支持 **GPT-SoVITS v2ProPlus 本地克隆**（按标点 `cut5` 分句 + 300 文件/150MB LRU `.ogg` 缓存）、**Azure AI Speech 旗舰女声**，以及 **8 角色 × 32 场景中/日双语离线语音包（0ms，共 512 条 `.ogg`）**，支持一键切换日配/中配（默认日配）。
-  - **三档显存模式 + 实时显存诊断**：支持「零显存 / 生图优先」「均衡省显存（默认，闲置自动卸载）」「满血实时克隆」，内置 GPU / Ollama / GPT-SoVITS 占用透明看板与一键释放显存；GPT-SoVITS 安装区分 **NVIDIA（CUDA）** 与 **AMD（ZLUDA 实验性）**。
+  - Galgame「中文字幕 · 逐句完整日语配音」双语模式：支持 **Fish Speech（OpenAudio S1-mini）本地零样本克隆**（300 文件/150MB LRU `.ogg` 缓存）、**Azure AI Speech 旗舰女声**，以及 **8 角色 × 32 场景中/日双语离线语音包（0ms，共 512 条 `.ogg`）**，支持一键切换日配/中配（默认日配）。
+  - **三档显存模式 + 实时显存诊断**：支持「零显存 / 生图优先」「均衡省显存（默认，闲置自动卸载）」「满血实时克隆」，内置 GPU / Ollama / Fish Speech 占用透明看板与一键释放显存。
 - **IDE 事件语音与智能防打扰陪伴**：Antigravity IDE 状态跃迁沿语音（`work_start` / `done` / `approval` / `error` / `context_high`）、`quiet` / `balanced` / `lively` 三档自主陪伴节流阀（Win32 全屏/演示静默 + 键鼠高频输入避让 + AFK 静默）、`Alt + Space` 全局呼出快捷聊天、45 分钟智能久坐提醒、Windows 开机自启与 `127.0.0.1:19820` HTTP Hook。
 
 ---
@@ -91,7 +91,7 @@ Deskpet/
       src/
         lib.rs                 Tauri 入口、托盘、开机自启、资源目录路由
         assets_mgr.rs          同仓库 Releases 角色动画与日语语音下载管理器
-        gpt_sovits.rs          GPT-SoVITS v2ProPlus（NVIDIA/AMD 分流、cut5 切分）
+        fish_speech.rs         Fish Speech（OpenAudio S1-mini）本地零样本语音引擎管理
         ai_voice.rs            OpenAI 对话、逐句日语配音翻译与三模语音调度
         scheduler.rs           7 级动作调度器、三层呼吸调度、连点生气与情绪映射
         passthrough.rs         33ms 像素级穿透、贴边歪头逆变换与 250Hz 非阻塞拖拽

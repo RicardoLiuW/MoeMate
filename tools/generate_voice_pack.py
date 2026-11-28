@@ -2,7 +2,7 @@
 """
 为 MoeMate 8 位角色批量生成本地双语情绪语音包（voices/zh/*.ogg + voices/ja/*.ogg）：
 - 中文语音（--lang zh）：保留并迁移现有 18 条 Azure HD 中文 .ogg，增量补齐至 32 条/角色；
-- 日语语音（--lang ja）：调用本地 GPT-SoVITS v2ProPlus API（默认 http://127.0.0.1:9880）+
+- 日语语音（--lang ja）：调用本地 Fish Speech v2ProPlus API（默认 http://127.0.0.1:8080）+
   ffmpeg loudnorm（-16 LUFS）编码为 24kHz 单声道 Opus .ogg（32 条/角色）。
 
 安全原则：
@@ -10,6 +10,7 @@
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -123,33 +125,28 @@ def synthesize_azure_ogg(region: str, key: str, ssml: bytes, retries: int = 3) -
     raise RuntimeError("重试耗尽")
 
 
-def synthesize_gpt_sovits_ogg(
-    gpt_url: str,
+def synthesize_fish_speech_ogg(
+    api_url: str,
     ja_text: str,
     ref_audio_path: str,
     prompt_text: str,
-    prompt_lang: str,
-    speed_factor: float,
     out_ogg: Path,
 ) -> None:
-    endpoint = f"{gpt_url.rstrip('/')}/tts"
+    endpoint = f"{api_url.rstrip('/')}/v1/tts"
+    ref_b64 = base64.b64encode(Path(ref_audio_path).read_bytes()).decode("ascii")
     payload = json.dumps(
         {
             "text": ja_text,
-            "text_lang": "ja",
-            "ref_audio_path": ref_audio_path,
-            "prompt_text": prompt_text,
-            "prompt_lang": prompt_lang or "zh",
-            "text_split_method": "cut5",
-            "split_bucket": False,
-            "fragment_interval": 0.15,
-            "top_k": 10,
+            "format": "wav",
+            "references": [{"audio": ref_b64, "text": prompt_text}],
+            "chunk_length": 200,
+            "normalize": True,
+            "streaming": False,
+            "use_memory_cache": "on",
+            "max_new_tokens": 1024,
             "top_p": 0.8,
-            "temperature": 0.65,
-            "repetition_penalty": 1.35,
-            "speed_factor": max(0.8, min(1.3, float(speed_factor or 1.0))),
-            "media_type": "wav",
-            "streaming_mode": False,
+            "repetition_penalty": 1.1,
+            "temperature": 0.8,
         }
     ).encode("utf-8")
     req = urllib.request.Request(
@@ -158,10 +155,16 @@ def synthesize_gpt_sovits_ogg(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    host = (urllib.parse.urlparse(endpoint).hostname or "").lower()
+    if host in ("127.0.0.1", "localhost", "::1"):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        resp_ctx = opener.open(req, timeout=120)
+    else:
+        resp_ctx = urllib.request.urlopen(req, timeout=120)
+    with resp_ctx as resp:
         wav_bytes = resp.read()
-    if len(wav_bytes) < 512:
-        raise RuntimeError(f"GPT-SoVITS 返回音频过短 ({len(wav_bytes)} bytes)")
+    if len(wav_bytes) < 512 or not wav_bytes.startswith(b"RIFF"):
+        raise RuntimeError(f"Fish Speech 返回无效 WAV 音频 ({len(wav_bytes)} bytes)")
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         tf.write(wav_bytes)
@@ -306,10 +309,11 @@ def run_ja(
     gpt_url: str,
     force: bool,
     dry_run: bool,
+    model_tag: str = "",
 ) -> tuple[int, int]:
     total_ok = 0
     total_skip = 0
-    gs_profiles = db_cfg.get("gptSovits", {}).get("charProfiles", {})
+    gs_profiles = (db_cfg.get("fishSpeech") or db_cfg.get("gptSovits") or {}).get("charProfiles", {})
     appdata = os.environ.get("APPDATA", "")
 
     for char_id, cfg in chars_spec.items():
@@ -342,7 +346,8 @@ def run_ja(
             ja_text = item.get("ja", "").strip()
             if not ja_text:
                 raise RuntimeError(f"缺少日语台词: {char_id}/{scene_key}")
-            sig = hashlib.sha256(f"ja|{ref_audio}|{prompt_text}|{speed_factor:.2f}|{ja_text}".encode("utf-8")).hexdigest()[:16]
+            sig_prefix = f"fish_speech|{model_tag}|ja" if model_tag else "fish_speech|ja"
+            sig = hashlib.sha256(f"{sig_prefix}|{ref_audio}|{prompt_text}|{ja_text}".encode("utf-8")).hexdigest()[:16]
             out_file = f"{scene_key}.ogg"
             out_path = ja_dir / out_file
 
@@ -365,8 +370,8 @@ def run_ja(
             if not ref_audio or not Path(ref_audio).is_file():
                 raise SystemExit(f"错误：角色 {char_id} 缺少参考音频 ref_voices/{char_id}.wav")
 
-            synthesize_gpt_sovits_ogg(
-                gpt_url, ja_text, ref_audio, prompt_text, prompt_lang, speed_factor, out_path
+            synthesize_fish_speech_ogg(
+                gpt_url, ja_text, ref_audio, prompt_text, out_path
             )
             new_scenes[scene_key] = {
                 "file": out_file,
@@ -385,6 +390,8 @@ def run_ja(
                 "lang": "ja",
                 "scenes": new_scenes,
             }
+            if model_tag:
+                manifest_obj["model"] = model_tag
             (ja_dir / "manifest.json").write_text(
                 json.dumps(manifest_obj, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -397,8 +404,9 @@ def main() -> int:
     parser.add_argument("--lang", choices=["zh", "ja", "both"], default="both", help="生成语种")
     parser.add_argument("--region", default="eastasia", help="Azure Speech 区域，默认 eastasia")
     parser.add_argument("--key-file", default=None, help="包含 Azure Speech Key 的文本文件路径")
-    parser.add_argument("--from-db", action="store_true", help="从本机 %APPDATA%\\Deskpet\\deskpet.db 读取配置")
-    parser.add_argument("--gpt-url", default="http://127.0.0.1:9880", help="GPT-SoVITS API 地址")
+    parser.add_argument("--from-db", action="store_true", help="从本机 %%APPDATA%%\\Deskpet\\deskpet.db 读取配置")
+    parser.add_argument("--fish-url", "--gpt-url", dest="gpt_url", default="http://127.0.0.1:8080", help="Fish Speech API 地址")
+    parser.add_argument("--model-tag", default="", help="可选模型标识，用于区分预生成语音包模型版本如 s2-pro")
     parser.add_argument("--assets-dir", default="", help="覆盖输出 chars 目录路径")
     parser.add_argument("--chars", default="", help="可选，逗号分隔的角色 ID 过滤")
     parser.add_argument("--force", action="store_true", help="强制重新生成全部语音")
@@ -420,7 +428,7 @@ def main() -> int:
         print(f"[ZH] 待生成/新生成 {zh_ok} 条，迁移/跳过 {zh_skip} 条。")
 
     if args.lang in ("ja", "both"):
-        ja_ok, ja_skip = run_ja(chars_spec, assets_chars, filter_set, db_cfg, args.gpt_url, args.force, args.dry_run)
+        ja_ok, ja_skip = run_ja(chars_spec, assets_chars, filter_set, db_cfg, args.gpt_url, args.force, args.dry_run, args.model_tag)
         print(f"[JA] 待生成/新生成 {ja_ok} 条，跳过 {ja_skip} 条。")
 
     return 0

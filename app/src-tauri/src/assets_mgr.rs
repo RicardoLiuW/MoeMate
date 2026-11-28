@@ -445,7 +445,7 @@ pub fn install_asset_targets(
 
         #[cfg(windows)]
         {
-            let (https, host, port, path) = crate::gpt_sovits::parse_full_url(&url)?;
+            let (https, host, port, path) = crate::fish_speech::parse_full_url(&url)?;
             let label = format!("{}（{}）", display_name, archive_name);
             let res = crate::ai_voice::winhttp_client::download_file_resumable(
                 https,

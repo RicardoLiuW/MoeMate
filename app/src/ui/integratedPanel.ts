@@ -1808,7 +1808,7 @@ export class IntegratedPanel {
       ? "语音关"
       : this.chatConfig.ttsMode === "local"
         ? "本地语音包"
-        : this.chatConfig.ttsMode === "gpt_sovits"
+        : this.chatConfig.ttsMode === "fish_speech"
           ? "克隆声优"
           : "Azure 女声";
     this.aiVoiceBadgeEl.dataset.on = this.chatConfig.ttsEnabled ? "true" : "false";

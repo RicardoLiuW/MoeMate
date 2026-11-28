@@ -364,7 +364,7 @@ pub struct Inner {
     pub chat_seq: AtomicU64,
     pub last_drag_voice_ms: AtomicI64,
     pub last_any_voice_ms: AtomicI64,
-    pub gpt_sovits: Arc<crate::gpt_sovits::GptSovitsRuntime>,
+    pub fish_speech: Arc<crate::fish_speech::FishSpeechRuntime>,
     pub assets_rt: Arc<crate::assets_mgr::AssetsRuntime>,
     pub pomodoro: Mutex<PomodoroStatusPayload>,
 }
@@ -429,7 +429,7 @@ impl Shared {
                 chat_seq: AtomicU64::new(1),
                 last_drag_voice_ms: AtomicI64::new(0),
                 last_any_voice_ms: AtomicI64::new(0),
-                gpt_sovits: Arc::new(crate::gpt_sovits::GptSovitsRuntime::default()),
+                fish_speech: Arc::new(crate::fish_speech::FishSpeechRuntime::new()),
                 assets_rt: Arc::new(crate::assets_mgr::AssetsRuntime::default()),
                 pomodoro: Mutex::new(PomodoroStatusPayload::default()),
             }),
@@ -478,9 +478,15 @@ impl Shared {
     }
 
     pub fn chat_ai_config(&self) -> crate::ai_voice::ChatAiConfig {
-        self.cached_setting("chatAiConfig")
+        let mut cfg: crate::ai_voice::ChatAiConfig = self
+            .cached_setting("chatAiConfig")
             .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        cfg.fish_speech.migrate_legacy_defaults();
+        if cfg.tts_mode == "gpt_sovits" {
+            cfg.tts_mode = "fish_speech".to_string();
+        }
+        cfg
     }
 
     pub fn assets_download_config(&self) -> crate::assets_mgr::AssetsDownloadConfig {
@@ -1018,12 +1024,9 @@ impl Shared {
         self.wake_passthrough();
         if !already {
             let cfg = self.chat_ai_config();
-            if cfg.gpt_sovits.auto_stop_on_exit {
-                self.inner
-                    .gpt_sovits
-                    .cancel_install
-                    .store(true, Ordering::SeqCst);
-                crate::gpt_sovits::stop_service(&cfg.gpt_sovits.api_url, &self.inner.gpt_sovits);
+            if cfg.fish_speech.auto_stop_on_exit {
+                self.inner.fish_speech.cancel_install.store(true, Ordering::SeqCst);
+                self.inner.fish_speech.stop();
             }
         }
     }

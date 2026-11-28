@@ -4,6 +4,24 @@
 
 ---
 
+## v3.1.0 · 2026-11-28 · 本地语音引擎切换至 Fish Speech（OpenAudio S1-mini）与原生 ROCm 加速
+
+### 新增与升级
+- **本地语音合成引擎全面替换为 Fish Speech（`fish_speech.rs` / `ai_voice.rs` / `vram.rs` / `settingsWindow.ts`）**：
+  - 移除 `gpt_sovits.rs`，新增 `fish_speech.rs`，基于 `/v1/tts` 零样本参考音频接口实现实时语音克隆与 Opus `.ogg` 缓存。
+  - 支持自动迁移 SQLite 中旧 `gptSovits` 配置与默认端口（`9880 -> 8080`）。
+- **原生 Windows ROCm 7.13 推理加速**：
+  - 启动参数注入 `MIOPEN_FIND_MODE=FAST`，将 DAC VQ 解码耗时从 ~13s 降至 ~0.2s。
+  - 配合 HIP Graph 与 `topk` 采样优化，OpenAudio S1-mini 单条合成提速约 3.3 倍。
+- **256 条日语离线语音包全面重制（`ja-voices-pack.zip`）**：
+  - 使用 Fish Speech（OpenAudio S1-mini）重新合成全部 8 角色 × 32 场景 = 256 条日语 `.ogg` 语音与 8 份 `manifest.json`，重新打包为 `ja-voices-pack.zip`（5.09 MB，264 条目）。
+  - 优化 `tools/generate_voice_pack.py`，支持本地回环地址自动绕过系统代理及 `--model-tag` 参数。
+
+### 修复
+- 清理 `lib.rs` 与 `ai_voice.rs` 中 9 条 Rust `unused variable` 编译警告，实现编译 0 警告。
+
+---
+
 ## v3.0.1 · 2026-11-24 · 启动可见性修复、显存治理、512 条双语语音、智能陪伴与贴边「暗中观察」
 
 ### 新增与升级

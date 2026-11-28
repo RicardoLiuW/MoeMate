@@ -22,7 +22,7 @@ mod assets_mgr;
 mod companion;
 mod db;
 mod foreground;
-mod gpt_sovits;
+mod fish_speech;
 mod http_hook;
 mod mask;
 mod model;
@@ -217,7 +217,7 @@ pub(crate) fn dispatch_daily_scene_voice(
             &skey,
             &zh_line,
             force,
-            &shared_clone.inner.gpt_sovits,
+            &shared_clone.inner.fish_speech,
         ) {
             let _ = shared_clone.inner.app.emit_to("main", "pet_tts", &payload);
         }
@@ -295,13 +295,9 @@ fn char_switch(char_id: String, shared: State<'_, Shared>) -> Result<CharState, 
     let _ = shared.inner.app.emit("pet_char_switched", &char_state);
 
     let cfg = shared.chat_ai_config();
-    if cfg.tts_mode == "gpt_sovits" && ai_voice::normalize_vram_mode(&cfg.vram_mode) != "zero_vram" {
-        let rt = shared.inner.gpt_sovits.clone();
-        let gpt_cfg = cfg.gpt_sovits;
-        let cid = char_id.clone();
-        std::thread::spawn(move || {
-            let _ = gpt_sovits::hot_swap_weights_if_needed(&gpt_cfg, &cid, &rt);
-        });
+    if cfg.tts_mode == "fish_speech" && ai_voice::normalize_vram_mode(&cfg.vram_mode) != "zero_vram" {
+        // Fish Speech uses zero-shot reference audio per request; no weight hot-swap needed.
+        let _ = &char_id;
     }
 
     Ok(char_state)
@@ -741,14 +737,13 @@ fn settings_set(
             let _ = app.emit("pet_muted", next_muted);
             let _ = app.emit("pet_chat_config", &cfg);
             if ai_voice::normalize_vram_mode(&cfg.vram_mode) == "zero_vram" {
-                let gs_cfg = cfg.gpt_sovits.clone();
-                let rt = shared.inner.gpt_sovits.clone();
+                let gs_cfg = cfg.fish_speech.clone();
+                let rt = shared.inner.fish_speech.clone();
                 let app_handle = app.clone();
-                let b_root = base_root();
                 std::thread::spawn(move || {
-                    gpt_sovits::stop_service(&gs_cfg.api_url, &rt);
-                    let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
-                    let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                    let _ = fish_speech::stop_service(&gs_cfg, &rt);
+                    let status = fish_speech::inspect_status(&gs_cfg, &rt);
+                    let _ = app_handle.emit_to("settings", "pet_fish_speech_status", &status);
                     let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
                     let _ = app_handle.emit_to("settings", "pet_vram_status", &vram_st);
                 });
@@ -767,14 +762,13 @@ fn settings_set(
             }
             let _ = app.emit("pet_chat_config", &cfg);
             if norm == "zero_vram" {
-                let gs_cfg = cfg.gpt_sovits.clone();
-                let rt = shared.inner.gpt_sovits.clone();
+                let gs_cfg = cfg.fish_speech.clone();
+                let rt = shared.inner.fish_speech.clone();
                 let app_handle = app.clone();
-                let b_root = base_root();
                 std::thread::spawn(move || {
-                    gpt_sovits::stop_service(&gs_cfg.api_url, &rt);
-                    let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
-                    let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                    let _ = fish_speech::stop_service(&gs_cfg, &rt);
+                    let status = fish_speech::inspect_status(&gs_cfg, &rt);
+                    let _ = app_handle.emit_to("settings", "pet_fish_speech_status", &status);
                     let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
                     let _ = app_handle.emit_to("settings", "pet_vram_status", &vram_st);
                 });
@@ -831,8 +825,8 @@ fn settings_set(
             let _ = app.emit("pet_chat_config", &cfg);
         }
         "vramStatus" => {
-            let gs_cfg = shared.chat_ai_config().gpt_sovits;
-            let rt = shared.inner.gpt_sovits.clone();
+            let gs_cfg = shared.chat_ai_config().fish_speech;
+            let rt = shared.inner.fish_speech.clone();
             let app_handle = app.clone();
             std::thread::spawn(move || {
                 let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
@@ -840,14 +834,13 @@ fn settings_set(
             });
         }
         "vramRelease" => {
-            let gs_cfg = shared.chat_ai_config().gpt_sovits;
-            let rt = shared.inner.gpt_sovits.clone();
+            let gs_cfg = shared.chat_ai_config().fish_speech;
+            let rt = shared.inner.fish_speech.clone();
             let app_handle = app.clone();
-            let b_root = base_root();
             std::thread::spawn(move || {
-                gpt_sovits::stop_service(&gs_cfg.api_url, &rt);
-                let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
-                let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                let _ = fish_speech::stop_service(&gs_cfg, &rt);
+                let status = fish_speech::inspect_status(&gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_fish_speech_status", &status);
                 let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
                 let _ = app_handle.emit_to("settings", "pet_vram_status", &vram_st);
                 let _ = app_handle.emit_to(
@@ -890,9 +883,9 @@ fn settings_set(
                 if let Some(r) = value.get("azureSpeechRegion").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
                     cfg.azure_speech_region = r.to_string();
                 }
-                if let Some(gs) = value.get("gptSovits") {
-                    if let Ok(parsed_gs) = serde_json::from_value::<gpt_sovits::GptSovitsConfig>(gs.clone()) {
-                        cfg.gpt_sovits = parsed_gs;
+                if let Some(fs) = value.get("fishSpeech") {
+                    if let Ok(parsed_fs) = serde_json::from_value::<fish_speech::FishSpeechConfig>(fs.clone()) {
+                        cfg.fish_speech = parsed_fs;
                     }
                 }
             }
@@ -912,7 +905,7 @@ fn settings_set(
                     &char_id,
                     seq,
                     &preview_text,
-                    &shared_clone.inner.gpt_sovits,
+                    &shared_clone.inner.fish_speech,
                 ) {
                     Ok((local_line, mut payload, status_msg)) => {
                         payload.force = true;
@@ -937,24 +930,23 @@ fn settings_set(
                 }
             });
         }
-        "gptSovitsStatus" => {
-            let mut gs_cfg = shared.chat_ai_config().gpt_sovits;
+        "fishSpeechStatus" => {
+            let mut gs_cfg = shared.chat_ai_config().fish_speech;
             if let Some(dir) = value.get("installDir").and_then(Value::as_str) {
                 gs_cfg.install_dir = dir.trim().to_string();
             }
             if let Some(url) = value.get("apiUrl").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
                 gs_cfg.api_url = url.trim().to_string();
             }
-            let b_root = base_root();
-            let rt = shared.inner.gpt_sovits.clone();
+            let rt = shared.inner.fish_speech.clone();
             let app_handle = app.clone();
             std::thread::spawn(move || {
-                let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
-                let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                let status = fish_speech::inspect_status(&gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_fish_speech_status", &status);
             });
         }
-        "gptSovitsInstall" => {
-            let mut gs_cfg = shared.chat_ai_config().gpt_sovits;
+        "fishSpeechInstall" => {
+            let mut gs_cfg = shared.chat_ai_config().fish_speech;
             if let Some(dir) = value.get("installDir").and_then(Value::as_str) {
                 gs_cfg.install_dir = dir.trim().to_string();
             }
@@ -967,38 +959,15 @@ fn settings_set(
             if let Some(url) = value.get("apiUrl").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
                 gs_cfg.api_url = url.trim().to_string();
             }
-            let assets_cfg = shared.assets_download_config();
-            let b_root = base_root();
-            let rt = shared.inner.gpt_sovits.clone();
+            let rt = shared.inner.fish_speech.clone();
             let app_handle = app.clone();
             std::thread::spawn(move || {
-                let init_status = gpt_sovits::GptSovitsStatusPayload {
-                    state: "installing".to_string(),
-                    label: "下载解压中".to_string(),
-                    install_dir: gpt_sovits::resolve_install_dir(&b_root, &gs_cfg.install_dir)
-                        .to_string_lossy()
-                        .to_string(),
-                    api_url: gs_cfg.api_url.clone(),
-                    missing_files: Vec::new(),
-                    managed_pid: None,
-                    error: None,
-                };
-                let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &init_status);
+                let init_status = fish_speech::inspect_status(&gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_fish_speech_status", &init_status);
 
-                let _ = gpt_sovits::install_engine(
-                    &b_root,
-                    &gs_cfg.install_dir,
-                    &gs_cfg.download_source,
-                    &gs_cfg.gpu_backend,
-                    &assets_cfg.github_repo,
-                    &assets_cfg.release_tag,
-                    rt.clone(),
-                    |prog| {
-                        let _ = app_handle.emit_to("settings", "pet_gpt_sovits_progress", &prog);
-                    },
-                );
-                let final_status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
-                let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &final_status);
+                let _ = fish_speech::install_engine(&app_handle, &gs_cfg, &rt);
+                let final_status = fish_speech::inspect_status(&gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_fish_speech_status", &final_status);
             });
         }
         "assetsStatus" => {
@@ -1088,7 +1057,7 @@ fn settings_set(
                             let wav = refs_dir.join(format!("{}.wav", ch.id));
                             if wav.is_file() {
                                 let entry = chat_cfg
-                                    .gpt_sovits
+                                    .fish_speech
                                     .char_profiles
                                     .entry(ch.id.clone())
                                     .or_default();
@@ -1133,34 +1102,29 @@ fn settings_set(
                 let _ = app.emit("pet_catalog_updated", &catalog);
             }
         }
-        "gptSovitsCancelInstall" => {
-            shared
-                .inner
-                .gpt_sovits
-                .cancel_install
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+        "fishSpeechCancelInstall" => {
+            shared.inner.fish_speech.cancel_install.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        "gptSovitsStart" => {
-            let mut gs_cfg = shared.chat_ai_config().gpt_sovits;
+        "fishSpeechStart" => {
+            let mut gs_cfg = shared.chat_ai_config().fish_speech;
             if let Some(dir) = value.get("installDir").and_then(Value::as_str) {
                 gs_cfg.install_dir = dir.trim().to_string();
             }
             if let Some(url) = value.get("apiUrl").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
                 gs_cfg.api_url = url.trim().to_string();
             }
-            let b_root = base_root();
-            let rt = shared.inner.gpt_sovits.clone();
+            let rt = shared.inner.fish_speech.clone();
             let app_handle = app.clone();
             std::thread::spawn(move || {
-                let res = gpt_sovits::start_service(&b_root, &gs_cfg, &rt);
-                let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
-                let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                let res = fish_speech::start_service(&app_handle, &gs_cfg, &rt);
+                let status = fish_speech::inspect_status(&gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_fish_speech_status", &status);
                 match res {
-                    Ok(()) => {
+                    Ok(_) => {
                         let _ = app_handle.emit_to(
                             "settings",
                             "pet_tts_status",
-                            serde_json::json!({ "ok": true, "message": format!("服务已启动（{}）", status.label) }),
+                            serde_json::json!({ "ok": true, "message": format!("服务已启动（{}）", if status.running { "运行中" } else { "已停止" }) }),
                         );
                     }
                     Err(err) => {
@@ -1173,29 +1137,28 @@ fn settings_set(
                 }
             });
         }
-        "gptSovitsStop" => {
-            let mut gs_cfg = shared.chat_ai_config().gpt_sovits;
+        "fishSpeechStop" => {
+            let mut gs_cfg = shared.chat_ai_config().fish_speech;
             if let Some(dir) = value.get("installDir").and_then(Value::as_str) {
                 gs_cfg.install_dir = dir.trim().to_string();
             }
             if let Some(url) = value.get("apiUrl").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
                 gs_cfg.api_url = url.trim().to_string();
             }
-            let b_root = base_root();
-            let rt = shared.inner.gpt_sovits.clone();
+            let rt = shared.inner.fish_speech.clone();
             let app_handle = app.clone();
             std::thread::spawn(move || {
-                gpt_sovits::stop_service(&gs_cfg.api_url, &rt);
-                let status = gpt_sovits::inspect_status(&b_root, &gs_cfg, &rt);
-                let _ = app_handle.emit_to("settings", "pet_gpt_sovits_status", &status);
+                let _ = fish_speech::stop_service(&gs_cfg, &rt);
+                let status = fish_speech::inspect_status(&gs_cfg, &rt);
+                let _ = app_handle.emit_to("settings", "pet_fish_speech_status", &status);
                 let _ = app_handle.emit_to(
                     "settings",
                     "pet_tts_status",
-                    serde_json::json!({ "ok": true, "message": "已停止 GPT-SoVITS 本地服务" }),
+                    serde_json::json!({ "ok": true, "message": "已停止 Fish Speech 本地服务" }),
                 );
             });
         }
-        "gptSovitsPickFile" => {
+        "fishSpeechPickFile" => {
             let request_id = value
                 .get("requestId")
                 .and_then(Value::as_str)
@@ -1208,7 +1171,7 @@ fn settings_set(
                 .to_string();
             let app_handle = app.clone();
             std::thread::spawn(move || {
-                let picked = gpt_sovits::pick_file_or_dir(&kind);
+                let picked = fish_speech::pick_file_or_dir(&kind);
                 let _ = app_handle.emit_to(
                     "settings",
                     "pet_file_picked",
@@ -1243,12 +1206,11 @@ fn settings_set(
                     let _ = app.emit_to("settings", "pet_muted", shared.snapshot().muted);
                     let _ = app.emit_to("settings", "pet_auto_start", autostart::is_windows_auto_start_enabled());
                     let _ = app.emit_to("settings", "pet_global_hotkey", hotkey::is_enabled(&shared));
-                    let gs_status = gpt_sovits::inspect_status(
-                        &base_root(),
-                        &shared.chat_ai_config().gpt_sovits,
-                        &shared.inner.gpt_sovits,
+                    let gs_status = fish_speech::inspect_status(
+                        &shared.chat_ai_config().fish_speech,
+                        &shared.inner.fish_speech,
                     );
-                    let _ = app.emit_to("settings", "pet_gpt_sovits_status", &gs_status);
+                    let _ = app.emit_to("settings", "pet_fish_speech_status", &gs_status);
                     let assets_st = assets_mgr::inspect_assets_status(
                         &assets_root(),
                         &shared.assets_download_config(),
@@ -1256,8 +1218,8 @@ fn settings_set(
                     );
                     let _ = app.emit_to("settings", "pet_assets_status", &assets_st);
                     {
-                        let gs_cfg = shared.chat_ai_config().gpt_sovits;
-                        let rt = shared.inner.gpt_sovits.clone();
+                        let gs_cfg = shared.chat_ai_config().fish_speech;
+                        let rt = shared.inner.fish_speech.clone();
                         let app_h = app.clone();
                         std::thread::spawn(move || {
                             let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
@@ -1289,12 +1251,11 @@ fn settings_set(
             let _ = app.emit_to("settings", "pet_muted", shared.snapshot().muted);
             let _ = app.emit_to("settings", "pet_auto_start", autostart::is_windows_auto_start_enabled());
             let _ = app.emit_to("settings", "pet_global_hotkey", hotkey::is_enabled(&shared));
-            let gs_status = gpt_sovits::inspect_status(
-                &base_root(),
-                &shared.chat_ai_config().gpt_sovits,
-                &shared.inner.gpt_sovits,
+            let gs_status = fish_speech::inspect_status(
+                &shared.chat_ai_config().fish_speech,
+                &shared.inner.fish_speech,
             );
-            let _ = app.emit_to("settings", "pet_gpt_sovits_status", &gs_status);
+            let _ = app.emit_to("settings", "pet_fish_speech_status", &gs_status);
             let assets_st = assets_mgr::inspect_assets_status(
                 &assets_root(),
                 &shared.assets_download_config(),
@@ -1302,8 +1263,8 @@ fn settings_set(
             );
             let _ = app.emit_to("settings", "pet_assets_status", &assets_st);
             {
-                let gs_cfg = shared.chat_ai_config().gpt_sovits;
-                let rt = shared.inner.gpt_sovits.clone();
+                let gs_cfg = shared.chat_ai_config().fish_speech;
+                let rt = shared.inner.fish_speech.clone();
                 let app_h = app.clone();
                 std::thread::spawn(move || {
                     let vram_st = vram::inspect_vram_status(&gs_cfg, &rt);
@@ -1347,12 +1308,12 @@ fn settings_set(
             | "chatClearHistory"
             | "settingsOpen"
             | "settingsReady"
-            | "gptSovitsStatus"
-            | "gptSovitsInstall"
-            | "gptSovitsCancelInstall"
-            | "gptSovitsStart"
-            | "gptSovitsStop"
-            | "gptSovitsPickFile"
+            | "fishSpeechStatus"
+            | "fishSpeechInstall"
+            | "fishSpeechCancelInstall"
+            | "fishSpeechStart"
+            | "fishSpeechStop"
+            | "fishSpeechPickFile"
             | "assetsStatus"
             | "assetsInstall"
             | "assetsCancelInstall"
@@ -1601,7 +1562,7 @@ async fn chat_send(
                 &reply_clone,
                 &binding_hint,
                 is_ai_reply,
-                &shared_clone.inner.gpt_sovits,
+                &shared_clone.inner.fish_speech,
             ) {
                 Ok((payload, fallback_hint)) => {
                     if let Some(hint) = fallback_hint {
@@ -1612,7 +1573,7 @@ async fn chat_send(
                 }
                 Err(reason) => {
                     eprintln!("[deskpet] 跳过语音合成: {reason}");
-                    if cfg_clone.tts_mode == "gpt_sovits" {
+                    if cfg_clone.tts_mode == "fish_speech" {
                         shared_clone.emit_bubble(format!("{reply_clone}（{reason}）"), 5500);
                     }
                 }
@@ -1765,7 +1726,7 @@ fn spawn_vram_idle_guard(shared: Shared) {
         if ai_voice::normalize_vram_mode(&cfg.vram_mode) != "balanced" {
             continue;
         }
-        let last_used = shared.inner.gpt_sovits.last_used();
+        let last_used = shared.inner.fish_speech.last_used();
         if last_used <= 0 {
             continue;
         }
@@ -1773,18 +1734,17 @@ fn spawn_vram_idle_guard(shared: Shared) {
         if now_ms() - last_used < timeout_ms {
             continue;
         }
-        if gpt_sovits::check_api_health(&cfg.gpt_sovits.api_url) {
-            gpt_sovits::stop_service(&cfg.gpt_sovits.api_url, &shared.inner.gpt_sovits);
-            let status = gpt_sovits::inspect_status(
-                &base_root(),
-                &cfg.gpt_sovits,
-                &shared.inner.gpt_sovits,
+        if fish_speech::check_api_health(&cfg.fish_speech.api_url).unwrap_or(false) {
+            let _ = fish_speech::stop_service(&cfg.fish_speech, &shared.inner.fish_speech);
+            let status = fish_speech::inspect_status(
+                &cfg.fish_speech,
+                &shared.inner.fish_speech,
             );
             let _ = shared
                 .inner
                 .app
-                .emit_to("settings", "pet_gpt_sovits_status", &status);
-            let vram_st = vram::inspect_vram_status(&cfg.gpt_sovits, &shared.inner.gpt_sovits);
+                .emit_to("settings", "pet_fish_speech_status", &status);
+            let vram_st = vram::inspect_vram_status(&cfg.fish_speech, &shared.inner.fish_speech);
             let _ = shared
                 .inner
                 .app
